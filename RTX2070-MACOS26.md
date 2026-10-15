@@ -62,3 +62,11 @@ open-gpu-kernel-modules root), then link NVRM as usual.
   the frame-present mode and the WindowServer priority were each ruled out by measurement.
 - Turing's copy-engine queue still cannot be built (upstream issue #32); copies run on the graphics channel.
 - Restarting WindowServer (`killall WindowServer`) freezes the machine with black screens on this setup.
+
+## Thanks
+
+Everything in this driver is the work of [NullMoth Systems](https://nullmothsystems.com) ([GitHub](https://github.com/nullmoth)) — the kernel extensions, the Metal plugin,
+the shader translator and the NVK port. This branch only adds the fixes listed above on top of their 2.0.1 release.
+If the driver is useful to you, support its author: [buymeacoffee.com/nullmoth](https://buymeacoffee.com/nullmoth).
+The driver builds on [metal2vulkan](https://github.com/steelbrain/metal2vulkan) by Anees Iqbal, NVIDIA's
+[open GPU kernel modules](https://github.com/NVIDIA/open-gpu-kernel-modules) and Mesa's NVK — see [NOTICE](NOTICE).
