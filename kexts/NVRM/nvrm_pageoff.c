@@ -21,6 +21,7 @@
 
 NV_STATUS nvrm_ce_copy_to_pages(nv_state_t *nv, NvU32 hClient, NvU32 hMemory, const NvU64 *pages, NvU64 pageCount,
                                 NvU64 length, NvU64 *pUsec);
+NV_STATUS nvrm_ce_memset(nv_state_t *nv, NvU32 hClient, NvU32 hMemory, NvU64 length, NvU64 *pUsec);
 
 volatile NvU64 nvrm_pageoff_last_runs, nvrm_pageoff_last_pages, nvrm_pageoff_coalesced, nvrm_pageoff_perpage;
 
@@ -123,6 +124,70 @@ NV_STATUS nvrm_ce_copy_to_pages(nv_state_t *nv, NvU32 hClient, NvU32 hMemory, co
     if ((st = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_OSAPI)) == NV_OK) {
         if ((st = rmDeviceGpuLocksAcquire(pGpu, GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_OSAPI)) == NV_OK) {
             st = _nvrmCopyLocked(pGpu, hClient, hMemory, pages, pageCount, length);
+            rmDeviceGpuLocksRelease(pGpu, GPUS_LOCK_FLAGS_NONE, NULL);
+        }
+        rmapiLockRelease();
+    }
+    t1 = osGetMonotonicTimeNs();
+    if (pUsec) *pUsec = (t1 - t0) / 1000;
+    threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+    NV_EXIT_RM_RUNTIME(sp, fp);
+    return st;
+}
+
+// Zero the first `length` bytes of hMemory on the copy engine, the RM's own CeUtils (as the page-off copy above). The CPU
+// path it replaces wrote through the write-combined BAR1 window at ~50 MB/s: 150-300 ms for each 1080p/1440p surface.
+static NV_STATUS _nvrmMemsetLocked(OBJGPU *pGpu, NvU32 hClient, NvU32 hMemory, NvU64 length)
+{
+    MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+    RsClient *pClient = NULL;
+    Memory *pMemory = NULL;
+    NV_STATUS st;
+
+    if (pMemoryManager == NULL) return NV_ERR_INVALID_STATE;
+    if (pMemoryManager->pCeUtils == NULL) {
+        st = memmgrInitCeUtils(pMemoryManager, NV_FALSE, NV_TRUE);
+        if (st != NV_OK) return st;
+    }
+    st = serverGetClientUnderLock(&g_resServ, hClient, &pClient);
+    if (st != NV_OK) return st;
+    st = memGetByHandle(pClient, hMemory, &pMemory);
+    if (st != NV_OK) return st;
+    if (length == 0 || length > memdescGetSize(pMemory->pMemDesc)) return NV_ERR_INVALID_ARGUMENT;
+
+    CEUTILS_MEMSET_PARAMS p = {0};
+    p.pMemDesc = pMemory->pMemDesc;
+    p.offset = 0;
+    p.length = length;
+    p.pattern = 0;
+    p.flags = NV0050_CTRL_MEMSET_FLAGS_ASYNC;
+    st = ceutilsMemset(pMemoryManager->pCeUtils, &p);
+    if (st == NV_OK) {
+        NvU32 spins = 0;
+        while (ceutilsUpdateProgress(pMemoryManager->pCeUtils) < p.submittedWorkId) {
+            if (++spins > 200000) { st = NV_ERR_TIMEOUT; break; }
+            osDelayUs(10);
+        }
+    }
+    return st;
+}
+
+NV_STATUS nvrm_ce_memset(nv_state_t *nv, NvU32 hClient, NvU32 hMemory, NvU64 length, NvU64 *pUsec)
+{
+    THREAD_STATE_NODE threadState;
+    NV_STATUS st;
+    void *fp;
+    nvidia_stack_t *sp = NULL;
+    NvU64 t0 = 0, t1 = 0;
+    OBJGPU *pGpu = NV_GET_NV_PRIV_PGPU(nv);
+
+    if (pGpu == NULL || length == 0) return NV_ERR_INVALID_ARGUMENT;
+    NV_ENTER_RM_RUNTIME(sp, fp);
+    threadStateInit(&threadState, THREAD_STATE_FLAGS_NONE);
+    t0 = osGetMonotonicTimeNs();
+    if ((st = rmapiLockAcquire(API_LOCK_FLAGS_NONE, RM_LOCK_MODULES_OSAPI)) == NV_OK) {
+        if ((st = rmDeviceGpuLocksAcquire(pGpu, GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_OSAPI)) == NV_OK) {
+            st = _nvrmMemsetLocked(pGpu, hClient, hMemory, length);
             rmDeviceGpuLocksRelease(pGpu, GPUS_LOCK_FLAGS_NONE, NULL);
         }
         rmapiLockRelease();
