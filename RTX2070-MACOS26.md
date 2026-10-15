@@ -8,7 +8,7 @@ submitted upstream.
 the code and these notes, and me testing every build on the machine below. NullMoth's contribution rules do not
 accept AI-written code, so nothing here is offered to them as a pull request.
 
-**Tested on one machine only:** GeForce RTX 2070 (TU106, 8 GB, 256 MB BAR1), Ryzen 5 5600G, MSI B450, macOS 26.7.1
+**Tested on one machine only:** GeForce RTX 2070 (TU106, 8 GB, 256 MB BAR1), Ryzen 5 5600G, MSI B550 GAMING GEN3, macOS 26.7.1
 (25G241), a 2560x1440 100 Hz and a 1920x1080 60 Hz display. Other cards and macOS versions are untested. These are
 kernel extensions: a bad build can stop the machine from starting. Use at your own risk.
 
