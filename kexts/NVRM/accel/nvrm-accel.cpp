@@ -24,6 +24,25 @@
 #include "IOAccelTask.h"
 #include "IOAccelMemoryMap.h"
 #include "../nvrm_gpuva_abi.h"
+// gst1: GPU utilisation, temperature and video memory in PerformanceStatistics (Activity Monitor's GPU History, Stats,
+// iStat Menus). The family builds that dictionary when it is read (IOAccelStatistics2::writePerformanceStats); NVAccel
+// serves the property itself: the family's counters first, then the numbers NVRM read from RM (nvrmGpuStats) at most
+// a second ago. NVRM is only asked while somebody reads (1 s cadence, stops 10 s after the last read). -nvaccelnogst: off.
+#include "../nvrm_gpustats_abi.h"
+#include <libkern/c++/OSSerialize.h>
+#include <mach/mach_time.h>
+#include <kern/clock.h>
+extern "C" void nvAccelWritePerformanceStats(void *stats, OSDictionary *dict, bool reset)
+    __asm__("__ZN18IOAccelStatistics221writePerformanceStatsEP12OSDictionaryb");
+static volatile uint32_t gGstValid, gGstGr, gGstFb, gGstVramTotalKB, gGstVramFreeKB;
+static volatile int32_t gGstTemp;
+static volatile uint64_t gGstAt, gGstWantedAt;
+static volatile SInt32 gGstArmed;
+static int gGstOff, gGstGrPct, gGstTempC, gGstSamplesI;
+static thread_call_t gGstCall;
+static const OSSymbol *gGstSym;
+static void nvAccelGstSample(thread_call_param_t, thread_call_param_t);
+static bool nvAccelGstSerialize(void *target, void *ref, OSSerialize *s);
 class NVMemoryMap;
 static unsigned long long nvAccelGpuVaAlloc(IOAccelMemoryMap *map,
                                            unsigned long long len, unsigned long long align);
@@ -38,7 +57,8 @@ static void               nvAccelWriteStamp(int index, unsigned int value);
 #else
 #define NV_LOG_TAG "NVAccel: "
 #endif
-#define ALOG(fmt, ...) do { kprintf(NV_LOG_TAG fmt "\n", ##__VA_ARGS__); IOLog(NV_LOG_TAG fmt "\n", ##__VA_ARGS__); } while (0)
+// log1: IOLog only - on macOS 26 kprintf output lands in the unified log as well, so the pair wrote every line twice
+#define ALOG(fmt, ...) do { IOLog(NV_LOG_TAG fmt "\n", ##__VA_ARGS__); } while (0)
 #include <libkern/c++/OSSymbol.h>
 #include "nvrm_vram_abi.h"
 #include <IOKit/IODeviceMemory.h>
@@ -53,12 +73,57 @@ int thread_call_enter_delayed(struct thread_call *call, uint64_t deadline);
 void clock_interval_to_deadline(uint32_t interval, uint32_t scale_factor, uint64_t *result);
 }
 static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
-                       gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
+                       gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree, gCntApTransient, gCntIopCacheFlush,
+                       gCntIopFlipKept, gCntIopRevalidate, gCntIopRevalidateMoved;
 static void nvaccelInstallSysctl(void);
 static int gNvAccelArmed = 0;
 // 1 once the headless check restored the plugin name without arming (no NVIDIA display head). The Metal plugin reads it:
 // a headless GPU hands frames to another GPU's WindowServer through system memory, so IOSurfaces must be copied out.
 static int gNvHeadless = 0;
+// sle1: Safari's GPU process (WebKit) may map code only from /System - its sandbox refuses /Library/GPUBundles, so the
+// plugin never loaded there and Safari drew pages on the CPU. With a copy of the bundle (NVK inside) under
+// /System/Library/Extensions on the unsealed system snapshot (Extras/sle/sle-plugin.sh), Metal is pointed at that copy,
+// but only while it matches the installed files; otherwise, or with -nvaccelnosle / debug.nvaccel_sle=0, at the usual one.
+static int gNvSle = 1;          // debug.nvaccel_sle: 1 = use the /System copy when it matches, 0 = never
+static int gNvSleState = 0;     // debug.nvaccel_sle_state: last publish chose 0 = /Library/GPUBundles (off), 1 = /System copy,
+                                // 2 = no /System copy, 3 = the /System copy differs from the installed files
+static const char kNvSlePluginName[] = "../../../System/Library/Extensions/NVMTLDriver";
+#include <sys/vnode.h>
+static long long nvSleFileSize(const char *path)
+{
+    long long size = -1;
+    vfs_context_t ctx = vfs_context_create(NULL);
+    if (!ctx) return -1;
+    vnode_t vp = NULLVP;
+    if (vnode_lookup(path, 0, &vp, ctx) == 0) {
+        struct vnode_attr va;
+        VATTR_INIT(&va); VATTR_WANTED(&va, va_data_size);
+        if (vnode_getattr(vp, &va, ctx) == 0 && VATTR_IS_SUPPORTED(&va, va_data_size)) size = (long long)va.va_data_size;
+        vnode_put(vp);
+    }
+    vfs_context_rele(ctx);
+    return size;
+}
+static int nvSleCheck(void)
+{
+    static const char *const pairs[][2] = {
+        { "/System/Library/Extensions/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver",
+          "/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver" },
+        { "/System/Library/Extensions/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib",
+          "/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib" },
+        { "/System/Library/Extensions/NVMTLDriver.bundle/Contents/MacOS/libvulkan_nouveau.dylib",
+          "/Library/GPUBundles/nvmtl/libvulkan_nouveau.dylib" },
+    };
+    for (unsigned i = 0; i < sizeof pairs / sizeof pairs[0]; i++) {
+        const long long a = nvSleFileSize(pairs[i][0]), b = nvSleFileSize(pairs[i][1]);
+        if (a < 0) return 2;
+        if (a != b) {
+            ALOG("sle1: %s is %lld bytes, %s %lld -- the /System copy is stale, not used", pairs[i][0], a, pairs[i][1], b);
+            return 3;
+        }
+    }
+    return 1;
+}
 #ifdef NMX_ACCEL
 SYSCTL_INT(_debug, OID_AUTO, nmxaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvHeadless, 0,
            "1 = AMD/Intel Metal device for apps; frames are copied to the framebuffer WindowServer draws");
@@ -104,15 +169,21 @@ public:
 };
 OSDefineMetaClassAndStructors(NVEventMachine, IOAccelEventMachineFast2)
 static void (*gEnableAccel)(const char *why) = nullptr;
+static void nvAccelIopCacheFlush(const char *why);
+static bool nvSVPend(unsigned id, int op, NVResource *resource = nullptr);
+static IOService *nvAccelNVRM();
+extern "C" struct sysctl_oid sysctl__debug_nvaccel_svdirty_why;
+extern "C" struct sysctl_oid sysctl__debug_nvaccel_svpend_live, sysctl__debug_nvaccel_svpend_high, sysctl__debug_nvaccel_svpend_rebuilds, sysctl__debug_nvaccel_svpend_full;   // sv2
 static int gNvScanout = 0;
 static int gNvAperture = 0;
 class NVDisplayMachine : public IOAccelLegacyDisplayMachine {
     OSDeclareDefaultStructors(NVDisplayMachine)
     NM_TAHOE_FWD(NVDisplayMachine)
 public:
-    bool displayModeWillChange() APPLE_KEXT_OVERRIDE { ALOG("DM displayModeWillChange"); return true; }
+    bool displayModeWillChange() APPLE_KEXT_OVERRIDE { ALOG("DM displayModeWillChange"); nvAccelIopCacheFlush("displayModeWillChange"); return true; }
     bool displayModeDidChange() APPLE_KEXT_OVERRIDE {
         ALOG("DM displayModeDidChange -> true");
+        nvAccelIopCacheFlush("displayModeDidChange");
         if (gEnableAccel) gEnableAccel("displayModeDidChange");
         return true;
     }
@@ -174,6 +245,7 @@ class IOAccelNVRMCarrier : public IOService {
 };
 OSDefineMetaClassAndStructors(IOAccelNVRMCarrier, IOService)
 
+static IOReturn nvPresentNewClient(task_t task, void *securityID, IOService *provider, IOUserClient **handler);   // pf1
 class NVAccel : public IOGraphicsAccelerator2 {
     OSDeclareDefaultStructors(NVAccel)
     NM_TAHOE_FWD(NVAccel)
@@ -249,6 +321,39 @@ public:
     IONotifier *fFBNote = nullptr;
     IONotifier *fIntelNote = nullptr;
     static NVAccel *gAccel;
+    OSObject *fGstStats = nullptr;          // gst1: the family's IOAccelStatistics2
+    OSSerializer *fGstSer = nullptr;
+    OSObject *newStatistics() APPLE_KEXT_OVERRIDE {
+        OSObject *st = IOGraphicsAccelerator2::newStatistics();
+        fGstStats = st;
+        return st;
+    }
+    // serve PerformanceStatistics ourselves (again, if the family replaced it)
+    void gstInstall() {
+        if (gGstOff || !fGstStats) return;
+        if (!gGstCall) gGstCall = thread_call_allocate(&nvAccelGstSample, nullptr);
+        if (!gGstSym) gGstSym = OSSymbol::withCStringNoCopy("nvrmGpuStats");
+        if (!fGstSer) fGstSer = OSSerializer::forTarget(this, &nvAccelGstSerialize, nullptr);
+        if (!gGstCall || !gGstSym || !fGstSer) return;
+        if (getProperty("PerformanceStatistics") != fGstSer) {
+            setProperty("PerformanceStatistics", fGstSer);
+            static SInt32 told; if (OSIncrementAtomic(&told) < 4) ALOG("gst1: PerformanceStatistics served by NVAccel (family counters + GPU utilisation, temperature, VRAM)");
+        }
+    }
+    // publish the plugin name to Metal: the /System copy when it is wanted and matches (sle1), else the Info.plist one
+    void publishPluginName(const char *why) {
+        if (!fMetalPlugin) return;
+        const int st = gNvSle ? nvSleCheck() : 0;
+        gNvSleState = st;
+        if (st == 1) setProperty("MetalPluginName", kNvSlePluginName);
+        else setProperty("MetalPluginName", fMetalPlugin);
+        ALOG("sle1: MetalPluginName -> %s (%s: %s)", st == 1 ? kNvSlePluginName : "the Info.plist name (/Library/GPUBundles)", why,
+             st == 1 ? "the /System copy matches the installed plugin" : st == 0 ? "off" :
+             st == 2 ? "no /System copy" : "the /System copy is stale");
+    }
+    static void sleFromSysctl(void) {
+        if (gAccel && gAccel->getProperty("MetalPluginName")) gAccel->publishPluginName("debug.nvaccel_sle");
+    }
     IOService *fFB = nullptr;
     IOService *volatile fFBs[kNvMaxFB] = {};
     unsigned fFBRegistered = 0;
@@ -301,6 +406,13 @@ public:
     // "!WindowServer" = only when armed) keeps the GPU that owns the display. Nothing here touches a display pipe or a
     // mode change. Boot-arg -nvaccelnoheadless keeps the old behaviour.
     static constexpr uint32_t kHeadlessDeadlineSec = 60;   // chosen: NVRMFB heads publish within ~20 s of start (#76 log)
+    // hs1: "within ~20 s of start" holds only once NVRM has started the card. With BAR1 left at its 256 MB firmware window
+    // NVRM waits 100 s before it does (nvrmsettle, "starting the NVIDIA card: waiting 100 s"), so the 60 s check found no
+    // head on an RTX 2070 with two monitors, declared it headless and WindowServer crash-looped in CoreDisplay when the
+    // heads came 40 s later (13.10.2026). Until NVRM reports its display stack ("nvrm-display", set after its auto-go)
+    // the check decides nothing and looks again every 30 s, at most 12 times.
+    static constexpr uint32_t kHeadlessRecheckSec = 30, kHeadlessMaxRechecks = 12;
+    uint32_t fHeadlessRechecks = 0;
     struct thread_call *fHeadlessCall = nullptr;
     void armHeadlessCheck() {
         int off = 0;
@@ -318,6 +430,20 @@ public:
         if (me->fRegLock) IOLockLock(me->fRegLock);
         const char *why = me->fFB ? "a display head published" : !me->fMetalPlugin ? "no plugin name to restore"
                         : me->getProperty("MetalPluginName") ? "the plugin name is already back" : nullptr;
+        if (!why && me->fHeadlessRechecks < kHeadlessMaxRechecks) {
+            IOService *nvrm = nvAccelNVRM();
+            if (nvrm && !nvrm->getProperty("nvrm-display")) {
+                me->fHeadlessRechecks++;
+                const OSNumber *st = OSDynamicCast(OSNumber, nvrm->getProperty("nvrm-autogo-settle-ms"));
+                ALOG("headless check: NVRM has not started the card yet (auto-go settle %u ms) -- undecided, looking again in %u s (%u/%u)",
+                     st ? st->unsigned32BitValue() : 0u, kHeadlessRecheckSec, me->fHeadlessRechecks, kHeadlessMaxRechecks);
+                uint64_t when = 0;
+                clock_interval_to_deadline(kHeadlessRecheckSec, kSecondScale, &when);
+                thread_call_enter_delayed(me->fHeadlessCall, when);
+                if (me->fRegLock) IOLockUnlock(me->fRegLock);
+                return;
+            }
+        }
         if (why) {
             ALOG("headless check: not headless (%s) -- nothing to do", why);
         } else {
@@ -330,11 +456,12 @@ public:
                 }
                 it->release();
             }
-            me->setProperty("MetalPluginName", me->fMetalPlugin);
+            me->publishPluginName("headless check");
             me->setProperty("NVAccelHeadless", kOSBooleanTrue);
             gNvHeadless = 1;
             ALOG("headless check: no NVIDIA display head after %u s -- MetalPluginName restored WITHOUT arming: apps get "
-                 "the NVIDIA Metal device, WindowServer stays on the display's GPU (%s)", kHeadlessDeadlineSec, owner);
+                 "the NVIDIA Metal device, WindowServer stays on the display's GPU (%s)",
+                 kHeadlessDeadlineSec + me->fHeadlessRechecks * kHeadlessRecheckSec, owner);
         }
         if (me->fRegLock) IOLockUnlock(me->fRegLock);
     }
@@ -415,7 +542,8 @@ public:
         deliverModeChange();
         gNvAccelArmed = 1;
         if (fMetalPlugin && !getProperty("MetalPluginName")) {
-            setProperty("MetalPluginName", fMetalPlugin);
+            publishPluginName("display armed");
+            gstInstall();
             ALOG("  MetalPluginName restored -- a NEW process that asks Metal for this accelerator "
                  "can now load the plugin (already-running ones will not)");
         }
@@ -474,6 +602,7 @@ public:
     IOService *fNVRM = nullptr;
     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
                            IOUserClient **handler) APPLE_KEXT_OVERRIDE {
+        if (type == 0x4E504631u) return nvPresentNewClient(owningTask, securityID, this, handler);   // pf1 'NPF1'
         if ((type & 0xFFFF0000u) != 0x4E560000u) {
             IOReturn fr = IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler);
             if (fUcLogged < 40) { fUcLogged++;
@@ -600,6 +729,15 @@ public:
         if (r) {
             registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "NVMTLDriver");
             gAccel = this; gEnableAccel = &NVAccel::enableFromHook;
+            { char nb[8]; if (PE_parse_boot_argn("-nvaccelnogst", nb, sizeof nb)) { gGstOff = 1; ALOG("gst1: off (-nvaccelnogst)"); } }
+            gstInstall();
+            // gst2: monitors (Stats) pair an accelerator with its PCI display by the accelerator's IOPCIMatch; the personality
+            // only carries the vendor-wide IOPCIPrimaryMatch, so they named the RTX 2070 "Unknown". An accelerator is not a
+            // PCI nub: no driver matches against this property.
+            if (IOPCIDevice *pdev = OSDynamicCast(IOPCIDevice, provider)) {
+                char m[16]; snprintf(m, sizeof m, "0x%04x%04x", pdev->configRead16(0x02), pdev->configRead16(0x00));
+                setProperty("IOPCIMatch", m);
+            }
             for (unsigned i = 0; i < NV_CARRIERS; i++) {
                 IOAccelNVRMCarrier *c = OSTypeAlloc(IOAccelNVRMCarrier);
                 if (!c) break;
@@ -643,6 +781,7 @@ public:
                     OSObject *mp = getProperty("MetalPluginName"); if (mp) mp->retain();
                     fMetalPlugin = mp;
                     removeProperty("MetalPluginName");
+                    { char nb[8]; if (PE_parse_boot_argn("-nvaccelnosle", nb, sizeof nb)) { gNvSle = 0; ALOG("sle1: off (-nvaccelnosle)"); } }
                     ALOG("MetalPluginName withheld -- nothing will load the Metal plugin until "
                          "`sysctl -w debug.nvaccelfb=1` puts it back, and a reboot takes it away again");
                     armHeadlessCheck();
@@ -744,6 +883,14 @@ void *NVResource::getApertureMemoryDescriptor(unsigned long long *a0)
     if (!m || !m->fPhys || !m->fBytes) {
         if (fApLogged < 8) { fApLogged++;
             ALOG("NVResource::getApertureMemoryDescriptor: no BAR1-backed vidmem at +0x88 (mem %p)", m); }
+        return nullptr;
+    }
+    // A transient grant (NVRMFB debug.nvrmfb_vram_transient) keeps no BAR1 window: its fPhys is where the window was
+    // while the memory was cleared, and other memory may sit there now. Same answer as a closed gate.
+    if (!m->fScanout && !m->fKva) {
+        OSAddAtomic64(1, &gCntApTransient);
+        if (fApLogged < 8) { fApLogged++;
+            ALOG("NVResource::getApertureMemoryDescriptor: vidmem %p is a transient grant (no BAR1 window) -- returning nullptr", m); }
         return nullptr;
     }
     IODeviceMemory *d = IODeviceMemory::withRange((IOPhysicalAddress)m->fPhys, (IOPhysicalLength)m->fBytes);
@@ -940,8 +1087,10 @@ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 
 static void nvAccelSurfScanoutSync(IOSurface *s);
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
-static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
+static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe, uint32_t pfWant);
 static void nvAccelIopHome(IOService *fb, unsigned head);
+static uint32_t nvAccelPfWant(void);
+static void nvAccelPfWait(uint32_t want);
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
     if (!gNvIop) return (IOReturn)0xe00002c7;
@@ -954,6 +1103,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     IOSurface *s  = txn->getPlaneIOSurface(0, 0);
     OSObject  *ro = txn->getPlaneResource(0, 0);
     if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
+    // pf1: the frame WindowServer committed just before this swap; the flip (or a copy below) waits for it on the GPU
+    const uint32_t pfWant = nvAccelPfWant();
 
     const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false;
     NVResource *res = OSDynamicCast(NVResource, ro);
@@ -971,6 +1122,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
              vm ? (unsigned long long)vm->fBytes : 0ull, (vm && vm->fKva) ? 1 : 0, vm ? (int)vm->fScanout : -1);
     }
     if (!s && vm && vm->fKva) {
+        nvAccelPfWait(pfWant);
         const unsigned char *rr = (const unsigned char *)res;
         w     = *(const volatile unsigned short *)(rr + 0xb0);
         h     = *(const volatile unsigned short *)(rr + 0xb2);
@@ -978,10 +1130,11 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         if ((unsigned long long)pitch < 4ull * w) NVIOP_FAIL(kIOReturnBadArgument, "resource %ux%u: +0xb8 reads %u, which is not a row pitch (need >= %u) — not a surface buffer", w, h, pitch, 4u * w);
         if ((unsigned long long)h * pitch > vm->fBytes) NVIOP_FAIL(kIOReturnOverrun, "resource %ux%u pitch %u exceeds its %llu bytes", w, h, pitch, (unsigned long long)vm->fBytes);
         src = (const volatile unsigned int *)vm->fKva; fromRes = true;
-    } else if (s && nvAccelIopFlip(fb, head, s, this)) {
+    } else if (s && nvAccelIopFlip(fb, head, s, this, pfWant)) {
         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
         return kIOReturnSuccess;
     } else if (s) {
+        nvAccelPfWait(pfWant);
         // A copied frame must come from the surface's newest pixels. Copying while they were still only in VRAM put a
         // stale, one-colour buffer on the panel every other frame: full-screen flicker, 5 of 40 flicker recordings
         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
@@ -1009,7 +1162,9 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     if (ret != kIOReturnSuccess || !q.kva || q.pitch < 4 || !q.height) NVIOP_FAIL(kIOReturnNotReady, "framebuffer would not describe its scanout (0x%x kva %p pitch %u)", (unsigned)ret, q.kva, q.pitch);
     if (w != q.width || h != q.height) NVIOP_FAIL(kIOReturnBadArgument, "source %ux%u is not the scanout's %ux%u", w, h, q.width, q.height);
 
-    nvAccelIopHome(fb, head);
+    // Copy into the boot scanout first and flip home after. While a zero-copy surface is on the panel the boot scanout is
+    // off screen, so the copy (through BAR1, ~0.3 s for 2560x1440 on a small-BAR card) is not watched being drawn; flipping
+    // home first showed the stale scanout being overwritten, the flicker of the login screen after a mode change.
     const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
     volatile unsigned int *d = (volatile unsigned int *)q.kva;
@@ -1018,6 +1173,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         volatile unsigned int *dp = d + (unsigned long)y * dpr;
         for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
     }
+    nvAccelIopHome(fb, head);
     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
     const SInt64 n = OSAddAtomic64(1, &gCntIopOk);
     const SInt64 nh = OSAddAtomic64(1, &gCntIopOkHead[head]);
@@ -1075,6 +1231,23 @@ static int nvaccelfb_sysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_debug, OID_AUTO, nvaccelfb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, nvaccelfb_sysctl, "I",
             "register the NVIDIA framebuffer with the accelerator display machine (1 = found_framebuffer, 2 = family sweep)");
+static int nvaccel_sle_sysctl SYSCTL_HANDLER_ARGS
+{
+    int v = gNvSle;
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || req->newptr == 0) return err;
+    gNvSle = v ? 1 : 0;
+    NVAccel::sleFromSysctl();
+    return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_sle, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            NULL, 0, nvaccel_sle_sysctl, "I",
+            "sle1: 1 = point Metal at the plugin copy under /System/Library/Extensions when it matches, 0 = never (new processes)");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_gst_gr, CTLFLAG_RD | CTLFLAG_LOCKED, &gGstGrPct, 0, "gst1: last graphics engine utilisation %");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_gst_temp, CTLFLAG_RD | CTLFLAG_LOCKED, &gGstTempC, 0, "gst1: last GPU temperature, C");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_gst_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &gGstSamplesI, 0, "gst1: NVRM samples taken");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_sle_state, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvSleState, 0,
+           "sle1: 0 = /Library/GPUBundles (off), 1 = /System copy in use, 2 = no /System copy, 3 = /System copy stale");
 #define NVACCEL_CNT(nm, var, desc) SYSCTL_QUAD(_debug, OID_AUTO, nm, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&var, desc)
 NVACCEL_CNT(nvaccel_vm_alloc,         gCntVmAlloc,        "NVVidMemory::allocPhysical successes");
 NVACCEL_CNT(nvaccel_vm_alloc_bytes,   gCntVmAllocBytes,   "bytes of VRAM granted to NVVidMemory");
@@ -1085,6 +1258,11 @@ SYSCTL_INT(_debug, OID_AUTO, nvaccel_vm_sticky, CTLFLAG_RW | CTLFLAG_LOCKED, &gV
 NVACCEL_CNT(nvaccel_vm_parked,        gCntVmParked,       "VRAM kept when the family freed a surface's VRAM");
 NVACCEL_CNT(nvaccel_vm_unparked,      gCntVmUnparked,     "allocations answered with the surface's kept VRAM");
 NVACCEL_CNT(nvaccel_vm_park_released, gCntVmParkReleased, "kept VRAM released (resource freed or grown)");
+NVACCEL_CNT(nvaccel_ap_transient,     gCntApTransient,    "aperture descriptors refused for transient (no BAR1 window) grants");
+NVACCEL_CNT(nvaccel_iop_cache_flush,  gCntIopCacheFlush,  "zero-copy flip cache flushes on display mode changes");
+NVACCEL_CNT(nvaccel_iop_flip_kept,    gCntIopFlipKept,    "frames that kept the last zero-copy flip because the family lock stayed busy");
+NVACCEL_CNT(nvaccel_iop_revalidate,   gCntIopRevalidate,  "zero-copy flip cache entries looked up again (settle window after a mode change, or every 64 hits)");
+NVACCEL_CNT(nvaccel_iop_revalidate_moved, gCntIopRevalidateMoved, "revalidations that found the surface on different VRAM than its cache entry");
 NVACCEL_CNT(nvaccel_res_new,          gCntResNew,         "NVResource objects created");
 NVACCEL_CNT(nvaccel_res_free,         gCntResFree,        "NVResource objects freed");
 NVACCEL_CNT(nvaccel_map_commit,       gCntMapCommit,      "GPU page-table commits (MAP_MEMORY_DMA ok)");
@@ -1128,11 +1306,175 @@ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_async, CTLFLAG_RW | CTLFLAG_LOCKED, &gI
 NVACCEL_CNT(nvaccel_iop_async_flips,   gCntIopAsync,        "swaps completed asynchronously");
 NVACCEL_CNT(nvaccel_iop_async_refused, gCntIopAsyncRefused, "async swaps NVKMS refused (that frame stayed off the panel)");
 NVACCEL_CNT(nvaccel_iop_async_drop,    gCntIopAsyncDrop,    "frames dropped because a flip was still in flight (never expected)");
+// pf1 (flip after fence): WindowServer waited for every frame's GPU work before its display-pipe swap, because the swap
+// flipped at once (the plugin's commitAndWaitUntilSubmitted was waitUntilCompleted: ~25% of CGXUpdateDisplay in a
+// spindump). Now the plugin in WindowServer registers one page of its own memory here. At the end of each presented
+// command buffer the GPU writes the frame's number s into slot[s % 64]; right after the commit the CPU writes s into
+// cpuWant. The swap takes cpuWant, and the flip - on the async thread call - waits until every frame up to it is
+// finished, at most debug.nvaccel_pf_budget_ms. debug.nvaccel_pf=0 stops waiting (the plugin's page stays mapped, so
+// turn NVMTL_PRESENT_FENCE=0 in nvrm610.conf as well to give WindowServer back its own wait).
+#define NV_PF_TYPE  0x4E504631u   /* 'NPF1': NVAccel::newUserClient type of the present-fence client */
+#define NV_PF_MAGIC 0x4E504631u
+#define NV_PF_OFF   0x4F464621u   /* 'OFF!': written by the kernel - the plugin goes back to waiting in WindowServer */
+#define NV_PF_SLOTS 64u
+struct NVPresentPage { volatile uint32_t slot[NV_PF_SLOTS]; volatile uint32_t cpuWant; volatile uint32_t magic; };
+static NVPresentPage *gPf;              // the registered page (kernel mapping), under gPfLock
+static void *gPfOwner;                  // the client that registered it
+static IOSimpleLock *gPfLock;
+static volatile SInt32 gPfUsers;        // waiters reading gPf; a closing client waits for them
+static volatile UInt32 gPfUpTo;         // every frame up to this number was seen finished
+static int gPfOn = 0, gPfBudgetMs = 100;   // pf4: off by default - see DEV-NOTES 48 (black squares, stale frames during the screen flash)
+static volatile SInt32 gPfTimeoutRun;  // timeouts in a row; 8 turn pf1 off
+static SInt64 gCntPfReady, gCntPfWaited, gCntPfTimeout, gCntPfWaitUs, gCntPfMaxUs, gCntPfClients;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_pf, CTLFLAG_RW | CTLFLAG_LOCKED, &gPfOn, 0, "pf1: 1 = a swap's flip waits until WindowServer's frame is finished on the GPU");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_pf_budget_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gPfBudgetMs, 0, "pf1: longest wait for a frame before it is flipped anyway");
+NVACCEL_CNT(nvaccel_pf_ready,   gCntPfReady,   "pf1: swaps whose frame the GPU had already finished");
+NVACCEL_CNT(nvaccel_pf_waited,  gCntPfWaited,  "pf1: swaps whose flip waited for the GPU");
+NVACCEL_CNT(nvaccel_pf_timeout, gCntPfTimeout, "pf1: swaps flipped after the budget ran out (frame maybe unfinished)");
+NVACCEL_CNT(nvaccel_pf_wait_us, gCntPfWaitUs,  "pf1: total microseconds flips waited for the GPU");
+NVACCEL_CNT(nvaccel_pf_max_us,  gCntPfMaxUs,   "pf1: longest single wait, microseconds");
+NVACCEL_CNT(nvaccel_pf_clients, gCntPfClients, "pf1: present-fence pages registered (one per WindowServer start)");
+static NVPresentPage *nvAccelPfGet(void)
+{
+    if (!gPfLock) return nullptr;
+    IOSimpleLockLock(gPfLock);
+    NVPresentPage *p = gPf;
+    if (p) OSIncrementAtomic(&gPfUsers);
+    IOSimpleLockUnlock(gPfLock);
+    return p;
+}
+static void nvAccelPfPut(NVPresentPage *p) { if (p) OSDecrementAtomic(&gPfUsers); }
+// The number a swap arriving now must wait for: WindowServer published it right after committing the frame, on the
+// thread that swaps next. 0 = no waiting (no page, knob off, the plugin's page not live).
+static uint32_t nvAccelPfWant(void)
+{
+    NVPresentPage *p = nvAccelPfGet();
+    if (!p) return 0;
+    // The page also carries the switch back to the plugin: knob off -> 'OFF!' (WindowServer waits for its frames
+    // itself again), knob on again -> live.
+    if (!gPfOn && p->magic == NV_PF_MAGIC) p->magic = NV_PF_OFF;
+    else if (gPfOn && p->magic == NV_PF_OFF) { p->magic = NV_PF_MAGIC; gPfTimeoutRun = 0; }
+    const uint32_t w = (gPfOn && p->magic == NV_PF_MAGIC) ? __atomic_load_n(&p->cpuWant, __ATOMIC_ACQUIRE) : 0;
+    nvAccelPfPut(p);
+    return w;
+}
+static bool nvAccelPfDone(const NVPresentPage *p, uint32_t want)
+{
+    uint32_t from = gPfUpTo;
+    if ((int32_t)(want - from) <= 0) return true;
+    if (want - from > NV_PF_SLOTS) from = want - NV_PF_SLOTS;
+    for (uint32_t s = from + 1; (int32_t)(want - s) >= 0; s++)
+        if ((int32_t)(__atomic_load_n(&p->slot[s % NV_PF_SLOTS], __ATOMIC_ACQUIRE) - s) < 0) return false;
+    for (UInt32 cur = gPfUpTo; (int32_t)(want - cur) > 0 && !OSCompareAndSwap(cur, want, &gPfUpTo); cur = gPfUpTo) {}
+    return true;
+}
+// Called on the flip's own thread (or before a copied frame): returns once every frame up to `want` is finished on the
+// GPU, WindowServer went away, the knob was turned off, or the budget ran out.
+static void nvAccelPfWait(uint32_t want)
+{
+    if (!want) return;
+    NVPresentPage *p = nvAccelPfGet();
+    if (!p) return;
+    if (nvAccelPfDone(p, want)) { OSAddAtomic64(1, &gCntPfReady); gPfTimeoutRun = 0; nvAccelPfPut(p); return; }
+    const uint64_t t0 = mach_absolute_time();
+    // capped at 500 ms: a closing client waits up to 1 s for readers of its page before it unmaps it
+    const int bms = gPfBudgetMs < 1 ? 1 : gPfBudgetMs > 500 ? 500 : gPfBudgetMs;
+    uint64_t budget; nanoseconds_to_absolutetime((uint64_t)bms * 1000000ull, &budget);
+    unsigned spins = 0; bool timedOut = false;
+    while (!nvAccelPfDone(p, want)) {
+        if (p->magic != NV_PF_MAGIC || !gPfOn) break;
+        if (mach_absolute_time() - t0 >= budget) { timedOut = true; break; }
+        if (spins < 80) { spins++; IODelay(25); } else IOSleep(1);   // ~2 ms of fine polling, then millisecond sleeps
+    }
+    uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+    const SInt64 us = (SInt64)(ns / 1000);
+    if (timedOut) {
+        const SInt64 n = OSAddAtomic64(1, &gCntPfTimeout);
+        if (n < 8 || (n & 1023) == 0)
+            ALOG("pf1: frame %u not finished by the GPU after %lld us (up to %u seen) - flipped anyway (#%lld)",
+                 want, (long long)us, (unsigned)gPfUpTo, (long long)n + 1);
+        if (OSIncrementAtomic(&gPfTimeoutRun) + 1 >= 8 && gPfOn) {
+            // The markers do not arrive: every frame would wait out the budget. Off, and the plugin is told to wait
+            // for its frames in WindowServer again (debug.nvaccel_pf=1 tries once more).
+            gPfOn = 0; p->magic = NV_PF_OFF;
+            ALOG("pf1: 8 frames in a row timed out - present fence OFF (debug.nvaccel_pf=0), WindowServer waits for its frames again");
+        }
+    } else {
+        gPfTimeoutRun = 0;
+        OSAddAtomic64(1, &gCntPfWaited); OSAddAtomic64(us, &gCntPfWaitUs);
+        if (us > gCntPfMaxUs) gCntPfMaxUs = us;
+    }
+    nvAccelPfPut(p);
+}
+extern "C" void proc_selfname(char *buf, int size);
+extern "C" int proc_selfpid(void);
+class NVPresentClient : public IOUserClient {
+    OSDeclareDefaultStructors(NVPresentClient)
+    task_t fTask = nullptr;
+    IOMemoryDescriptor *fMd = nullptr; IOMemoryMap *fMap = nullptr;
+public:
+    bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE {
+        if (!IOUserClient::initWithTask(owningTask, securityID, type)) return false;
+        fTask = owningTask; return true;
+    }
+    // Selector 0: register(address, length) - one page-aligned page of the caller's own memory, which its GPU writes.
+    IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) APPLE_KEXT_OVERRIDE {
+        if (selector != 0 || !args || args->scalarInputCount != 2) return kIOReturnBadArgument;
+        const mach_vm_address_t va = args->scalarInput[0]; const mach_vm_size_t len = args->scalarInput[1];
+        if (!va || (va & PAGE_MASK) || len < sizeof(NVPresentPage) || len > 65536 || (len & PAGE_MASK)) return kIOReturnBadArgument;
+        if (fMap) return kIOReturnExclusiveAccess;
+        IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(va, len, kIODirectionInOut, fTask);
+        if (!md) return kIOReturnNoMemory;
+        if (md->prepare() != kIOReturnSuccess) { md->release(); return kIOReturnVMError; }
+        IOMemoryMap *map = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere);
+        if (!map) { md->complete(); md->release(); return kIOReturnVMError; }
+        fMd = md; fMap = map;
+        NVPresentPage *p = (NVPresentPage *)map->getVirtualAddress();
+        if (!gPfLock) { IOSimpleLock *l = IOSimpleLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gPfLock)) IOSimpleLockFree(l); }
+        if (!gPfLock) return kIOReturnNoMemory;
+        IOSimpleLockLock(gPfLock);
+        gPf = p; gPfOwner = this; gPfUpTo = 0;   // a new WindowServer counts from 1 again
+        IOSimpleLockUnlock(gPfLock);
+        const SInt64 n = OSAddAtomic64(1, &gCntPfClients);
+        ALOG("pf1: pid %d registered its present-fence page (%llu bytes) - swaps now wait for the frame on the GPU, not WindowServer (#%lld)",
+             proc_selfpid(), (unsigned long long)len, (long long)n + 1);
+        return kIOReturnSuccess;
+    }
+    void drop() {
+        if (gPfLock) {
+            IOSimpleLockLock(gPfLock);
+            if (gPfOwner == this) { gPf = nullptr; gPfOwner = nullptr; }
+            IOSimpleLockUnlock(gPfLock);
+        }
+        if (!fMap && !fMd) return;
+        // A flip may still read this page (taken before it was unpublished - also when a newer WindowServer replaced
+        // it): unmap only once no reader is left. Readers stop within the 500 ms budget cap, so 1 s always covers them.
+        for (unsigned i = 0; i < 1000 && OSAddAtomic(0, &gPfUsers); i++) IOSleep(1);
+        if (fMap) { fMap->release(); fMap = nullptr; }
+        if (fMd) { fMd->complete(); fMd->release(); fMd = nullptr; }
+    }
+    IOReturn clientClose() APPLE_KEXT_OVERRIDE { drop(); terminate(); return kIOReturnSuccess; }
+    void free() APPLE_KEXT_OVERRIDE { drop(); IOUserClient::free(); }
+};
+OSDefineMetaClassAndStructors(NVPresentClient, IOUserClient)
+static IOReturn nvPresentNewClient(task_t task, void *securityID, IOService *provider, IOUserClient **handler)
+{
+    char name[32] = {}; proc_selfname(name, sizeof name);
+    if (strncmp(name, "WindowServer", sizeof name)) return kIOReturnNotPermitted;
+    NVPresentClient *uc = new NVPresentClient;
+    if (!uc) return kIOReturnNoMemory;
+    if (!uc->initWithTask(task, securityID, NV_PF_TYPE)) { uc->release(); return kIOReturnNoMemory; }
+    if (!uc->attach(provider)) { uc->release(); return kIOReturnInternalError; }
+    if (!uc->start(provider)) { uc->detach(provider); uc->release(); return kIOReturnInternalError; }
+    *handler = uc;
+    return kIOReturnSuccess;
+}
 static int gCrcHead = 0;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_crc_head, CTLFLAG_RW | CTLFLAG_LOCKED, &gCrcHead, 0, "b85k-crc: which head debug.nvaccel_crc reads");
 static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS;
 SYSCTL_PROC(_debug, OID_AUTO, nvaccel_crc, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_crc_sysctl, "I",
             "b85k-crc: display CRC32 of what head nvaccel_crc_head is showing (0 = unavailable)");
+extern struct sysctl_oid sysctl__debug_nvaccel_vic, sysctl__debug_nvaccel_vic_queries, sysctl__debug_nvaccel_vic_novram;   // vic1, defined with the surfvram code
 static bool gSysctlInstalled = false;
 static void nvaccelInstallSysctl(void)
 {
@@ -1143,6 +1485,9 @@ static void nvaccelInstallSysctl(void)
     gSysctlInstalled = true;
 #else
     sysctl_register_oid(&sysctl__debug_nvaccelfb);
+    sysctl_register_oid(&sysctl__debug_nvaccel_sle);            sysctl_register_oid(&sysctl__debug_nvaccel_sle_state);
+    sysctl_register_oid(&sysctl__debug_nvaccel_gst_gr); sysctl_register_oid(&sysctl__debug_nvaccel_gst_temp);
+    sysctl_register_oid(&sysctl__debug_nvaccel_gst_samples);
     sysctl_register_oid(&sysctl__debug_nvaccel_headless);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc);       sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc_bytes);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc);     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc_bytes);
@@ -1150,6 +1495,14 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_sticky);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_parked);      sysctl_register_oid(&sysctl__debug_nvaccel_vm_unparked);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_park_released);
+    sysctl_register_oid(&sysctl__debug_nvaccel_ap_transient);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_cache_flush);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_kept);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_revalidate);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_revalidate_moved);
+    sysctl_register_oid(&sysctl__debug_nvaccel_svdirty_why);
+    sysctl_register_oid(&sysctl__debug_nvaccel_svpend_live);   sysctl_register_oid(&sysctl__debug_nvaccel_svpend_high);
+    sysctl_register_oid(&sysctl__debug_nvaccel_svpend_rebuilds); sysctl_register_oid(&sysctl__debug_nvaccel_svpend_full);
     sysctl_register_oid(&sysctl__debug_nvaccel_res_new);        sysctl_register_oid(&sysctl__debug_nvaccel_res_free);
     sysctl_register_oid(&sysctl__debug_nvaccel_map_commit);     sysctl_register_oid(&sysctl__debug_nvaccel_map_release);
     sysctl_register_oid(&sysctl__debug_nvaccel_map_free);
@@ -1171,6 +1524,12 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
+    sysctl_register_oid(&sysctl__debug_nvaccel_pf);             sysctl_register_oid(&sysctl__debug_nvaccel_pf_budget_ms);
+    sysctl_register_oid(&sysctl__debug_nvaccel_pf_ready);       sysctl_register_oid(&sysctl__debug_nvaccel_pf_waited);
+    sysctl_register_oid(&sysctl__debug_nvaccel_pf_timeout);     sysctl_register_oid(&sysctl__debug_nvaccel_pf_wait_us);
+    sysctl_register_oid(&sysctl__debug_nvaccel_pf_max_us);      sysctl_register_oid(&sysctl__debug_nvaccel_pf_clients);
+    sysctl_register_oid(&sysctl__debug_nvaccel_vic);            sysctl_register_oid(&sysctl__debug_nvaccel_vic_queries);
+    sysctl_register_oid(&sysctl__debug_nvaccel_vic_novram);
     gSysctlInstalled = true;
     ALOG("sysctl debug.nvaccelfb installed -- `sudo sysctl -w debug.nvaccelfb=1` registers the framebuffer");
 #endif
@@ -1233,6 +1592,63 @@ static IOService *nvAccelNVRM()
     return a->fNVRM;
 }
 
+// gst1: one NVRM sample; keeps itself going while PerformanceStatistics is being read
+static void nvAccelGstSample(thread_call_param_t, thread_call_param_t)
+{
+    NVAccel *a = NVAccel::gAccel;
+    IOService *nvrm = a ? nvAccelNVRM() : nullptr;
+    if (a && nvrm && gGstSym) {
+        struct NvrmGpuStats st; bzero(&st, sizeof st);
+        if (nvrm->callPlatformFunction(gGstSym, false, &st, nullptr, nullptr, nullptr) == kIOReturnSuccess) {
+            gGstGr = st.grUtil100; gGstFb = st.fbUtil100; gGstTemp = st.tempC;
+            gGstVramTotalKB = st.vramTotalKB; gGstVramFreeKB = st.vramFreeKB; gGstValid = st.valid;
+            gGstGrPct = (int)((st.grUtil100 + 50) / 100); gGstTempC = st.tempC;
+            const int n = ++gGstSamplesI;
+            if (n <= 3) ALOG("gst1: sample %d: gr %u (0.01 %%), fb %u, temp %d C, vram %u of %u MB free (valid 0x%x)", n,
+                             st.grUtil100, st.fbUtil100, (int)st.tempC, st.vramFreeKB >> 10, st.vramTotalKB >> 10, st.valid);
+            gGstAt = mach_absolute_time();
+        }
+        a->gstInstall();
+    }
+    uint64_t ten = 0; nanoseconds_to_absolutetime(10ull * 1000 * 1000 * 1000, &ten);
+    if (gGstCall && mach_absolute_time() - gGstWantedAt < ten) {
+        uint64_t dl = 0; clock_interval_to_deadline(1000, kMillisecondScale, &dl);
+        thread_call_enter_delayed(gGstCall, dl);
+    } else {
+        gGstArmed = 0;
+    }
+}
+static void gstNum(OSDictionary *d, const char *key, uint64_t v, int bits)
+{
+    OSNumber *n = OSNumber::withNumber(v, bits);
+    if (n) { d->setObject(key, n); n->release(); }
+}
+static bool nvAccelGstSerialize(void *target, void *ref, OSSerialize *s)
+{
+    NVAccel *a = (NVAccel *)target;
+    OSDictionary *d = OSDictionary::withCapacity(64);
+    if (!a || !d) { if (d) d->release(); return false; }
+    if (a->fGstStats) nvAccelWritePerformanceStats(a->fGstStats, d, false);
+    gGstWantedAt = mach_absolute_time();
+    if (gGstCall && OSCompareAndSwap(0, 1, &gGstArmed)) thread_call_enter(gGstCall);
+    uint64_t stale = 0; nanoseconds_to_absolutetime(5ull * 1000 * 1000 * 1000, &stale);
+    if (gGstAt && mach_absolute_time() - gGstAt < stale) {
+        const uint32_t v = gGstValid;
+        if (v & NVRM_GST_UTIL) {
+            uint32_t pct = (gGstGr + 50) / 100; if (pct > 100) pct = 100;
+            gstNum(d, "Device Utilization %", pct, 32); gstNum(d, "Renderer Utilization %", pct, 32);
+        }
+        if ((v & NVRM_GST_TEMP) && gGstTemp > 0 && gGstTemp < 150) gstNum(d, "Temperature(C)", (uint64_t)gGstTemp, 32);
+        if (v & NVRM_GST_VRAM) {
+            const uint64_t tot = (uint64_t)gGstVramTotalKB * 1024, fr = (uint64_t)gGstVramFreeKB * 1024;
+            gstNum(d, "vramUsedBytes", tot > fr ? tot - fr : 0, 64); gstNum(d, "vramFreeBytes", fr, 64);
+        }
+    }
+    const bool ok = d->serialize(s);
+    d->release();
+    return ok;
+}
+
 static IOReturn nvAccelGpuVaCall(const char *fn, struct NVRMGpuVaRequest *g)
 {
     IOService *nvrm = nvAccelNVRM();
@@ -1278,27 +1694,63 @@ static void nvFamUnlock(NVAccel *a)
     IOLockUnlock(*(IOLock *volatile *)((unsigned char *)a + 0x88));
 }
 static unsigned gNVSVLockMiss;
-enum { kNVSVPend = 512 };
+// sv2: the pending table (surfaces whose newest pixels are in VRAM, waiting for a page-off) is a hash on the surface ID:
+// 8192 slots, linear probing, tombstones, rebuilt in place once live + tombstones pass three quarters. The old 512 linear
+// slots filled within minutes of a boot with Safari open (WebKit's tiles and WebGL buffers live in VRAM and are composited
+// from there, never paged off); every refused dirty notice (why 9, ~100 a second) made the plugin read the whole frame
+// back through the CPU - 7-12 MB per WebGL frame.
+enum { kNVSVPend = 8192, kNVSVPendBits = 13, kNVSVPendMask = kNVSVPend - 1 };
+static const unsigned kNVSVTomb = 0xFFFFFFFFu;
 static unsigned gNVSVPendId[kNVSVPend];
 static NVResource *gNVSVPendResource[kNVSVPend];
+static unsigned gNVSVPendTmpId[kNVSVPend];
+static NVResource *gNVSVPendTmpRes[kNVSVPend];
+static unsigned gNVSVPendLive, gNVSVPendTombs, gNVSVPendHigh, gNVSVPendRebuilds, gNVSVPendFull;
+SYSCTL_UINT(_debug, OID_AUTO, nvaccel_svpend_live, CTLFLAG_RD | CTLFLAG_LOCKED, &gNVSVPendLive, 0, "sv2: surfaces pending a page-off now");
+SYSCTL_UINT(_debug, OID_AUTO, nvaccel_svpend_high, CTLFLAG_RD | CTLFLAG_LOCKED, &gNVSVPendHigh, 0, "sv2: most surfaces pending at once since boot");
+SYSCTL_UINT(_debug, OID_AUTO, nvaccel_svpend_rebuilds, CTLFLAG_RD | CTLFLAG_LOCKED, &gNVSVPendRebuilds, 0, "sv2: pending-table rebuilds (tombstones swept)");
+SYSCTL_UINT(_debug, OID_AUTO, nvaccel_svpend_full, CTLFLAG_RD | CTLFLAG_LOCKED, &gNVSVPendFull, 0, "sv2: dirty notices refused because the table held its limit");
 static IOSimpleLock *gNVSVPendLock;
-static bool nvSVPend(unsigned id, int op, NVResource *resource = nullptr)
+static inline unsigned nvSVSlot(unsigned id) { return (id * 2654435761u) >> (32 - kNVSVPendBits); }
+static void nvSVPendRebuild(void)   // under gNVSVPendLock
 {
-    if (!id) return op == 1 ? false : false;
-    if (!gNVSVPendLock) return op == 1 ? false : false;
-    bool r = false; int freeSlot = -1;
-    IOSimpleLockLock(gNVSVPendLock);
-    for (int i = 0; i < kNVSVPend; i++) {
-        if (gNVSVPendId[i] == id) {
-            r = true;
-            if (op == 0) { gNVSVPendId[i] = 0; gNVSVPendResource[i] = nullptr; }
-            else if (op == 1) gNVSVPendResource[i] = resource;
-            break;
-        }
-        if (!gNVSVPendId[i] && freeSlot < 0) freeSlot = i;
+    for (unsigned i = 0; i < kNVSVPend; i++) {
+        gNVSVPendTmpId[i] = gNVSVPendId[i]; gNVSVPendTmpRes[i] = gNVSVPendResource[i];
+        gNVSVPendId[i] = 0; gNVSVPendResource[i] = nullptr;
     }
-    if (op == 1 && !r) { if (freeSlot >= 0) { gNVSVPendId[freeSlot] = id; gNVSVPendResource[freeSlot] = resource; r = true; } }
-    else if (op == 1) r = true;
+    for (unsigned i = 0; i < kNVSVPend; i++) {
+        const unsigned id = gNVSVPendTmpId[i];
+        if (!id || id == kNVSVTomb) continue;
+        unsigned s = nvSVSlot(id);
+        while (gNVSVPendId[s]) s = (s + 1) & kNVSVPendMask;
+        gNVSVPendId[s] = id; gNVSVPendResource[s] = gNVSVPendTmpRes[i];
+    }
+    gNVSVPendTombs = 0; gNVSVPendRebuilds++;
+}
+// op 0: forget the surface; op 1: mark it pending for this resource (false = no room); op 2: is it pending?
+static bool nvSVPend(unsigned id, int op, NVResource *resource)
+{
+    if (!id || id == kNVSVTomb || !gNVSVPendLock) return false;
+    bool r = false;
+    IOSimpleLockLock(gNVSVPendLock);
+    unsigned s = nvSVSlot(id), freeSlot = kNVSVPend;
+    for (unsigned n = 0; n < kNVSVPend; n++, s = (s + 1) & kNVSVPendMask) {
+        const unsigned v = gNVSVPendId[s];
+        if (v == id) { r = true; break; }
+        if (v == kNVSVTomb) { if (freeSlot == kNVSVPend) freeSlot = s; continue; }
+        if (!v) { if (freeSlot == kNVSVPend) freeSlot = s; break; }
+    }
+    if (r) {
+        if (op == 0) { gNVSVPendId[s] = kNVSVTomb; gNVSVPendResource[s] = nullptr; gNVSVPendLive--; gNVSVPendTombs++; }
+        else if (op == 1) gNVSVPendResource[s] = resource;
+    } else if (op == 1) {
+        if (freeSlot != kNVSVPend && gNVSVPendLive < kNVSVPend / 2) {
+            if (gNVSVPendId[freeSlot] == kNVSVTomb) gNVSVPendTombs--;
+            gNVSVPendId[freeSlot] = id; gNVSVPendResource[freeSlot] = resource; gNVSVPendLive++; r = true;
+            if (gNVSVPendLive > gNVSVPendHigh) gNVSVPendHigh = gNVSVPendLive;
+            if (gNVSVPendLive + gNVSVPendTombs > kNVSVPend / 4 * 3) nvSVPendRebuild();
+        } else gNVSVPendFull++;
+    }
     IOSimpleLockUnlock(gNVSVPendLock);
     return r;
 }
@@ -1308,9 +1760,10 @@ static void nvSVForgetResource(NVResource *resource)
 {
     if (!resource || !gNVSVPendLock) return;
     IOSimpleLockLock(gNVSVPendLock);
-    for (unsigned i = 0; i < kNVSVPend; i++) if (gNVSVPendResource[i] == resource) {
-        gNVSVPendId[i] = 0;
+    if (gNVSVPendLive) for (unsigned i = 0; i < kNVSVPend; i++) if (gNVSVPendResource[i] == resource) {
+        gNVSVPendId[i] = kNVSVTomb;
         gNVSVPendResource[i] = nullptr;
+        gNVSVPendLive--; gNVSVPendTombs++;
     }
     IOSimpleLockUnlock(gNVSVPendLock);
 }
@@ -1319,22 +1772,49 @@ static unsigned gNVSVOk, gNVSVRefused;
 static inline void nvSVZero(void *p, unsigned long n) { volatile unsigned char *b = (volatile unsigned char *)p; while (n--) *b++ = 0; }
 
 static unsigned gNVSVDirty, gNVSVDirtyRefused, gNVSVPageoff, gNVSVPageoffFail;
-static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
+// why1: why a dirty notice was refused (the plugin then reads the whole frame back itself). 1 no device cache,
+// 2 no NVResource, 3 no NVVidMemory, 4 vidmem without an RM handle, 5 resource type not 0xc0, 6 resource flag 0x8000,
+// 7 no valid-bits array, 8 plane > 15, 9 pending table refused.
+static SInt64 gNVSVWhy[10];
+static int nvaccel_svdirty_why_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+    char b[200]; int n = 0;
+    for (int i = 1; i < 10; i++) n += snprintf(b + n, sizeof b - (size_t)n, "%s%d:%lld", i > 1 ? " " : "", i, (long long)gNVSVWhy[i]);
+    return sysctl_handle_string(oidp, b, (size_t)n + 1, req);
+}
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_svdirty_why, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_svdirty_why_sysctl, "A",
+            "why1: refused surfvram dirty notices by reason (1 cache 2 res 3 vidmem 4 rmhandle 5 type 6 flag8000 7 valid 8 plane 9 pending)");
+static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane, int *why)
 {
     volatile unsigned char *r = (volatile unsigned char *)res;
     unsigned char type = r[0x14];
     unsigned int fl = *(volatile unsigned int *)(r + 0xc);
     volatile unsigned short *valid = *(unsigned short *volatile *)(r + 0x30);
-    if (type != 0xc0 || (fl & 0x8000) || !valid || plane > 15) return NVRM_SS_NO_CACHE;
+    *why = type != 0xc0 ? 5 : (fl & 0x8000) ? 6 : !valid ? 7 : plane > 15 ? 8 : 0;
+    if (*why) return NVRM_SS_NO_CACHE;
     if (!gNVSVPendLock) gNVSVPendLock = IOSimpleLockAlloc();
-    if (!nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(*(void *volatile *)((unsigned char *)cache + 0x10)), 1, res)) return NVRM_SS_NO_CACHE;
+    if (!nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(*(void *volatile *)((unsigned char *)cache + 0x10)), 1, res)) { *why = 9; return NVRM_SS_NO_CACHE; }
     _ZN20IOSurfaceDeviceCache10setCurrentEv(cache);
     valid[6] |= (unsigned short)(1u << plane);
     valid[0] &= (unsigned short)~(1u << plane);
     return 0;
 }
+// vic1 (VRAM import cache): plane | 0x80000000 on the DIRTY escape is a query, not a dirty notice - the answer is
+// 0x40000000 | (the surface's VRAM allocation cookie & 0x3fffffff), or an NVRM_SS_* refusal. NVRMFB never reuses a
+// cookie, so the plugin keeps its import of a surface's VRAM across texture wraps for as long as the cookie it was made
+// under is still the answer (CoreAnimation wraps the same IOSurfaces ~500 times a second; every wrap was a full import:
+// share + dup + GPU VA + page tables, ~15% of WindowServer's main thread). debug.nvaccel_vic tells the plugin the kernel
+// understands the query (an older NVAccel would take the bit for a plane index).
+static int gVicOn = 1;
+static SInt64 gCntVicQuery, gCntVicNoVram;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_vic, CTLFLAG_RW | CTLFLAG_LOCKED, &gVicOn, 0, "vic1: 1 = the VRAM-identity query is answered; 0 = refused (the plugin imports every wrap again)");
+NVACCEL_CNT(nvaccel_vic_queries, gCntVicQuery,  "vic1: VRAM-identity queries answered");
+NVACCEL_CNT(nvaccel_vic_novram,  gCntVicNoVram, "vic1: queries for a surface with no RM VRAM (the plugin imports as before)");
 static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigned cmd)
 {
+    const bool vicQuery = cmd == NVRM_ESC_SURF_DIRTY && (p->plane & 0x80000000u);
+    const unsigned plane = p->plane & 0x7fffffffu;
     p->hSrcClient = p->hSrcMemory = 0;
     if (p->version != NVRM_SURFSHARE_VERSION) { p->status = NVRM_SS_BAD_VERSION; return kIOReturnSuccess; }
     NVAccel *a = NVAccel::gAccel;
@@ -1348,13 +1828,29 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
     void *surf = _ZN13IOSurfaceRoot13lookupSurfaceEjP4task(gNVSVRoot, p->surfaceID, task);
     if (!surf) { p->status = NVRM_SS_NO_SURFACE; gNVSVRefused++; return kIOReturnSuccess; }
     if (!nvFamLock(a, false)) { ((OSObject *)surf)->release(); p->status = NVRM_SS_OFF; return kIOReturnSuccess; }
-    void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, surf, p->plane);
+    void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, surf, plane);
     OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
     NVResource *res = OSDynamicCast(NVResource, ctx);
     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
+    if (vicQuery) {
+        const UInt64 cookie = (vm && vm->fRmHandle && vm->fBytes) ? vm->fAllocationCookie : 0;
+        p->status = !gVicOn ? NVRM_SS_OFF : cookie ? (0x40000000u | (unsigned)(cookie & 0x3fffffffu)) : NVRM_SS_NO_VRAM;
+        OSAddAtomic64(1, cookie ? &gCntVicQuery : &gCntVicNoVram);
+        if (cache) ((OSObject *)cache)->release();
+        nvFamUnlock(a);
+        ((OSObject *)surf)->release();
+        return kIOReturnSuccess;
+    }
     if (cmd == NVRM_ESC_SURF_DIRTY) {
-        p->status = (cache && res && vm && vm->fRmHandle) ? nvAccelSurfDirty(cache, res, p->plane) : NVRM_SS_NO_CACHE;
+        int why = !cache ? 1 : !res ? 2 : !vm ? 3 : !vm->fRmHandle ? 4 : 0;
+        p->status = why ? NVRM_SS_NO_CACHE : nvAccelSurfDirty(cache, res, plane, &why);
         if (p->status == 0) gNVSVDirty++; else gNVSVDirtyRefused++;
+        if (why > 0 && why < 10 && OSAddAtomic64(1, &gNVSVWhy[why]) < 6) {
+            volatile unsigned char *rr = (volatile unsigned char *)res;
+            ALOG("why1 surfvram dirty REFUSED, reason %d: surface %u plane %u res %p type 0x%x flags 0x%x valid %p | vidmem %p handle %p scanout %d %llu B",
+                 why, p->surfaceID, p->plane, res, res ? (unsigned)rr[0x14] : 0u, res ? *(volatile unsigned int *)(rr + 0xc) : 0u,
+                 res ? *(void *volatile *)(rr + 0x30) : nullptr, vm, vm ? (void *)vm->fRmHandle : nullptr, vm ? (int)vm->fScanout : -1, vm ? vm->fBytes : 0ull);
+        }
         if (gNVSVDirty + gNVSVDirtyRefused <= 6 || ((gNVSVDirty + gNVSVDirtyRefused) & 4095) == 0)
             ALOG("surfvram dirty: surface %u plane %u type 0x%x -> %#x (dirty %u, refused %u)", p->surfaceID, p->plane,
                  res ? (unsigned)((volatile unsigned char *)res)[0x14] : 0u, p->status, gNVSVDirty, gNVSVDirtyRefused);
@@ -1512,22 +2008,34 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
 
 static IOSurface *gIopFlipFront[kNvMaxFB], *gIopFlipPrev[kNvMaxFB];
 static bool gIopFlipped[kNvMaxFB];
+static unsigned gIopDropRun[kNvMaxFB];
 static unsigned gIopFlipLogs;
 static bool nvAccelIopFlipNo(int why) { OSAddAtomic64(1, &gCntIopFlipNo[why & 7]); return false; }
-struct NVIopFlipCache { IOSurface *s; NVResource *res; NVVidMemory *vm; void *kmem; unsigned long long bytes; unsigned long long use; };
+struct NVIopFlipCache { IOSurface *s; NVResource *res; NVVidMemory *vm; void *kmem; unsigned long long bytes; unsigned long long use;
+                        uint64_t at; unsigned hits; };
 static NVIopFlipCache gIopFlipCache[8];
 static IOSimpleLock *gIopFlipCacheLock;
 static unsigned long long gIopFlipCacheTick;
-static bool nvAccelIopCacheGet(IOSurface *s, NVResource **res, NVVidMemory **vm, void **kmem, unsigned long long *bytes)
+// An entry looked up while a mode change is still settling can name VRAM the surface is about to leave (one buffer of
+// WindowServer's swap chain then shows an old frame and the panel alternates - the login screen flicker after the flush
+// came in), and an entry from before a change can outlive it (the 100 Hz black panel). So entries made inside the
+// settle window are looked up again on their next flip, and every entry again every 64 hits.
+static volatile uint64_t gIopSettleUntil;
+#define NV_IOP_SETTLE_NS   2000000000ull
+#define NV_IOP_REVALIDATE  64u
+static bool nvAccelIopCacheGet(IOSurface *s, NVResource **res, NVVidMemory **vm, void **kmem, unsigned long long *bytes, bool *stale)
 {
+    *stale = false;
     if (!gIopFlipCacheLock) return false;
     bool hit = false;
+    const uint64_t settle = gIopSettleUntil;
     IOSimpleLockLock(gIopFlipCacheLock);
     for (unsigned i = 0; i < 8; i++) if (gIopFlipCache[i].s == s) {
         NVVidMemory *v = gIopFlipCache[i].vm;
         if (v && v->fRmHandle == gIopFlipCache[i].kmem && v->fBytes == gIopFlipCache[i].bytes) {
             *res = gIopFlipCache[i].res; *vm = v; *kmem = gIopFlipCache[i].kmem; *bytes = gIopFlipCache[i].bytes;
             gIopFlipCache[i].use = ++gIopFlipCacheTick; hit = true;
+            *stale = gIopFlipCache[i].at < settle || (++gIopFlipCache[i].hits % NV_IOP_REVALIDATE) == 0;
         }
         break;
     }
@@ -1550,15 +2058,38 @@ static void nvAccelIopCachePut(IOSurface *s, NVResource *res, NVVidMemory *vm, v
     drop = gIopFlipCache[k].s;
     gIopFlipCache[k].s = s; gIopFlipCache[k].res = res; gIopFlipCache[k].vm = vm; gIopFlipCache[k].kmem = kmem;
     gIopFlipCache[k].bytes = bytes; gIopFlipCache[k].use = ++gIopFlipCacheTick;
+    gIopFlipCache[k].at = mach_absolute_time(); gIopFlipCache[k].hits = 0;
     IOSimpleLockUnlock(gIopFlipCacheLock);
     if (drop) ((OSObject *)drop)->release();
+}
+// A mode change can leave an IOSurface with a new resource and VRAM while its old NVVidMemory is still alive (same
+// handle, same size), and the entry above would keep flipping that old memory: after a refresh change (75 -> 100 Hz on
+// a DisplayPort panel) the panel stayed black with every flip "ok", and the other head flickered, until a colour-profile
+// change made WindowServer create new surfaces. Each flip after a flush looks the surface up again.
+static void nvAccelIopCacheFlush(const char *why)
+{
+    if (!gIopFlipCacheLock) return;
+    IOSurface *drop[8] = {};
+    unsigned n = 0;
+    gIopSettleUntil = mach_absolute_time() + NV_IOP_SETTLE_NS;
+    IOSimpleLockLock(gIopFlipCacheLock);
+    for (unsigned i = 0; i < 8; i++) {
+        if (gIopFlipCache[i].s) drop[n++] = gIopFlipCache[i].s;
+        gIopFlipCache[i] = NVIopFlipCache();
+    }
+    IOSimpleLockUnlock(gIopFlipCacheLock);
+    for (unsigned i = 0; i < n; i++) ((OSObject *)drop[i])->release();
+    // flip1: after a mode change NVRMFB puts its own home buffer back on screen; forget that a zero-copy frame was up,
+    // or the "kept" path (lock busy) leaves that stale home buffer showing for up to 30 frames
+    for (unsigned h = 0; h < kNvMaxFB; h++) { gIopFlipped[h] = false; gIopDropRun[h] = 0; }
+    if (OSAddAtomic64(1, &gCntIopCacheFlush) < 16) ALOG("iop: flip cache flushed (%u entries) on %s", n, why);
 }
 extern "C" {
 void _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(void *pipe, void *arg);
 struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
 int thread_call_enter(struct thread_call *call);
 }
-struct NVIopAsync { void *pipe; IOService *fb; IOSurface *s; struct NVRMFlipRequest f; volatile SInt32 busy; struct thread_call *call; };
+struct NVIopAsync { void *pipe; IOService *fb; IOSurface *s; struct NVRMFlipRequest f; volatile SInt32 busy; struct thread_call *call; uint32_t pfWant; };
 static NVIopAsync gIopAs[kNvMaxFB];
 static SInt32 gIopAsyncRefuseRun;
 static bool nvAccelIopAsyncBusy(const void *pipe)
@@ -1572,6 +2103,7 @@ static void nvAccelIopAsyncRun(void *p0, void *)
     NVIopAsync *e = (NVIopAsync *)p0;
     const unsigned head = (unsigned)(e - gIopAs);
     IOSurface *s = e->s; e->s = nullptr;
+    nvAccelPfWait(e->pfWant);   // pf1: the panel gets the frame once the GPU has finished it
     const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
     IOReturn rr = sym ? e->fb->callPlatformFunction(sym, false, &e->f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
     if (sym) sym->release();
@@ -1596,7 +2128,7 @@ static void nvAccelIopAsyncRun(void *p0, void *)
     __atomic_store_n(&e->busy, 0, __ATOMIC_RELEASE);
     _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(e->pipe, nullptr);
 }
-static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSurface *s, const struct NVRMFlipRequest *f)
+static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSurface *s, const struct NVRMFlipRequest *f, uint32_t pfWant)
 {
     NVIopAsync *e = &gIopAs[head];
     for (unsigned i = 0; i < 50 && __atomic_load_n(&e->busy, __ATOMIC_ACQUIRE); i++) IOSleep(1);
@@ -1607,13 +2139,13 @@ static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSur
     if (!e->call) e->call = thread_call_allocate(nvAccelIopAsyncRun, e);
     if (!e->call) return false;
     ((OSObject *)s)->retain();
-    e->pipe = pipe; e->fb = fb; e->s = s;
+    e->pipe = pipe; e->fb = fb; e->s = s; e->pfWant = pfWant;
     for (unsigned i = 0; i < sizeof *f; i++) ((volatile unsigned char *)&e->f)[i] = ((const unsigned char *)f)[i];
     __atomic_store_n(&e->busy, 1, __ATOMIC_RELEASE);
     thread_call_enter(e->call);
     return true;
 }
-static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe)
+static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe, uint32_t pfWant)
 {
     if (!gIopFlip || !fb || !s || head >= kNvMaxFB) return false;
     // zero-copy scan-out is an NVIDIA display-engine flip; another vendor's panel (NMIntelFB) always takes the copy
@@ -1622,10 +2154,44 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     if (!a) return nvAccelIopFlipNo(1);
     if (s->getPixelFormat() != 0x42475241u) return nvAccelIopFlipNo(2);
     NVResource *res = nullptr; NVVidMemory *vm = nullptr; void *kmem = nullptr; unsigned long long bytes = 0;
-    if (nvAccelIopCacheGet(s, &res, &vm, &kmem, &bytes)) {
+    bool stale = false;
+    const bool cached = nvAccelIopCacheGet(s, &res, &vm, &kmem, &bytes, &stale);
+    if (cached && stale && nvFamLock(a, true)) {
+        // reval1: one try-lock, no waiting; a busy lock keeps the entry for this flip and asks again on the next.
+        void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
+        OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
+        NVResource *r2 = OSDynamicCast(NVResource, ctx);
+        NVVidMemory *v2 = r2 ? nvres_vidmem(r2) : nullptr;
+        void *k2 = (v2 && v2->fRmHandle && v2->fBytes && !v2->fScanout) ? v2->fRmHandle : nullptr;
+        const unsigned long long b2 = v2 ? v2->fBytes : 0;
+        if (cache) ((OSObject *)cache)->release();
+        nvFamUnlock(a);
+        const SInt64 nr = OSAddAtomic64(1, &gCntIopRevalidate);
+        if (k2 && (r2 != res || v2 != vm || k2 != kmem)) {
+            const SInt64 nm = OSAddAtomic64(1, &gCntIopRevalidateMoved);
+            if (nm < 16) ALOG("iop: surface 0x%x moved to other VRAM since its flip cache entry (res %p -> %p, revalidation #%lld)",
+                              s->getSurfaceID(), res, r2, (long long)nr + 1);
+        }
+        if (k2) { res = r2; vm = v2; kmem = k2; bytes = b2; }
+        nvAccelIopCachePut(s, res, vm, kmem, bytes);
+    } else if (cached) {
         OSAddAtomic64(1, &gCntIopFlipHit);
     } else {
-        if (!nvFamLock(a, true)) return nvAccelIopFlipNo(3);
+        // A miss needs the family lock, which WindowServer holds while it composites (and right after a mode change every
+        // surface misses: the cache was flushed). Wait for it briefly - a try-lock, so a lock this thread already holds
+        // cannot deadlock - and if it stays busy while this head already shows a zero-copy frame, keep that frame up
+        // (the transaction completes, the next one looks again) rather than falling back to the slow copy + home flip.
+        bool locked = nvFamLock(a, true);
+        for (unsigned i = 0; !locked && i < 20; i++) { IODelay(100); locked = nvFamLock(a, true); }
+        if (!locked) {
+            if (gIopFlipped[head] && gIopDropRun[head] < 30) {
+                gIopDropRun[head]++; OSAddAtomic64(1, &gCntIopFlipKept);
+                return true;
+            }
+            gIopDropRun[head] = 0;
+            return nvAccelIopFlipNo(3);
+        }
+        gIopDropRun[head] = 0;
         void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
         OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
         res = OSDynamicCast(NVResource, ctx);
@@ -1645,7 +2211,8 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     if (!W || !H || P < 4 * W || H * P > bytes) return nvAccelIopFlipNo(6);
     struct NVRMFlipRequest f; nvSVZero(&f, sizeof f);
     f.version = NVRM_FLIP_ABI_VERSION; f.kapiMemory = kmem; f.allocationCookie = vm->fAllocationCookie; f.width = (unsigned)W; f.height = (unsigned)H; f.pitch = (unsigned)P;
-    if (gIopAsync && pipe) return nvAccelIopAsyncStart(pipe, fb, head, s, &f);
+    if (gIopAsync && pipe) return nvAccelIopAsyncStart(pipe, fb, head, s, &f, pfWant);
+    nvAccelPfWait(pfWant);
     const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
     IOReturn rr = sym ? fb->callPlatformFunction(sym, false, &f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
     if (sym) sym->release();
