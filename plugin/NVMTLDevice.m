@@ -405,6 +405,7 @@ static void nvmtl_install_hw_resource_pools(id dev)
     if (!nvmtl_process_is_allowed()) { nvlog("  not allow-listed: no device for %s", getprogname()); return nil; }
     nvlog("MTLIOAccelDevice's initWithAcceleratorPort: -> %p", (__bridge void *)self);
     gNVMTLMainDevice = self;
+    { extern void nvmtl_dp1_install(void); nvmtl_dp1_install(); }   // dp1: drawable presents wait for their GPU writes
     nvmtl_install_hw_resource_pools(self);
     [self nvmtlProbeGPUPass];
     if (nvmtl_vk_init()) {

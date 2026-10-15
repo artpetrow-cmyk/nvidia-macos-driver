@@ -117,6 +117,8 @@ extern id gNVMTLMainDevice;
   @public nvk_cmdbuf _c; NVMTLCommandQueue *_queue; BOOL _committed; BOOL _capacityHeld; MTLCommandBufferStatus _cbstatus;
   NVMTLTexture *_present;
   NSMutableArray *_presentations;
+  NSMutableArray *_latePresents;  // dp1: drawable presents the app made while this buffer still wrote the drawable
+  BOOL _presentsClosed;           // dp1: the GPU work is done, a present runs at once (class lock)
   NSMutableArray *_handlers;
   NSMutableArray *_scratch;
   NSMutableSet *_resources;
