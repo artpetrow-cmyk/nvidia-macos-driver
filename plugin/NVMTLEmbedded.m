@@ -209,9 +209,10 @@ static void nvmtl_clear_embedded_slot(NVMTLCommandBuffer *cb, uint32_t set, uint
 }
 void nvmtl_bind_embedded(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NSDictionary *bufferAtIndex)
 {
-    if (!cb || !fn) return;
-    if (nvmtl_static_samplers_on()) {
-        for (NSArray *pair in nvmtl_static_samplers(fn)) {
+    if (!cb || !fn || (fn->_embNone && nvmtl_hot_on(2))) return;
+    NSArray *statics = nvmtl_static_samplers_on() ? nvmtl_static_samplers(fn) : nil;
+    if (statics.count) {
+        for (NSArray *pair in statics) {
             NVMTLSamplerState *s = pair[1];
             nvmtl_retain_resource(cb, s);
             if (nvmtl_vk_bind_sampler(&cb->_c, set, [pair[0] unsignedIntValue], &s->_s))
@@ -219,6 +220,9 @@ void nvmtl_bind_embedded(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn
         }
     }
     NSArray<NVMTLEmbeddedPlan *> *embedded = nvmtl_embedded_plan(fn);
+    // hot2: both lists are computed once per function; when both are empty every later call (twice per draw: two
+    // associated-object lookups, retains, the caller's buffer table) is skipped
+    if (!embedded.count && !statics.count) fn->_embNone = YES;
     if (!embedded.count) return;
     extern int nvmtl_vk_emb_same(nvk_cmdbuf *, uint32_t, const void *, const uint64_t *, uint32_t);
     extern void nvmtl_vk_emb_note(nvk_cmdbuf *, uint32_t, const void *, const uint64_t *, uint32_t);
