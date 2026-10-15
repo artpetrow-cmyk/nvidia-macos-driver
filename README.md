@@ -1,5 +1,8 @@
 # NullMoth NVIDIA Driver for macOS
 
+> **Fork:** branch `rtx2070-macos26` is NullMoth 2.0.1 plus fixes for an RTX 2070 on macOS 26, made with an AI
+> assistant and tested on one machine. Not affiliated with NullMoth. See [RTX2070-MACOS26.md](RTX2070-MACOS26.md).
+
 A Metal driver for NVIDIA GeForce cards on macOS 15 Sequoia (Intel Macs and OpenCore PCs). It is open source; the
 kernel extensions, the Metal plugin, the shader translator and the Mac app are all in this repository.
 
