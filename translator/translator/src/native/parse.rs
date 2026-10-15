@@ -572,6 +572,16 @@ pub(super) fn is_ignored_call_line(line: &str) -> bool {
     if line.contains("@llvm.lifetime.") {
         return true;
     }
+    // asmbar1 (NullMoth dev): an empty inline-asm barrier, `call void asm sideeffect "", ""()` - ANGLE's Metal shaders
+    // keep one (`__asm__ volatile("")`) to stop the compiler moving code across it. It emits nothing, reads and writes
+    // no value, and a GPU module has no use for it. Only that exact form - empty template, no constraints, no operands -
+    // is dropped; any other inline asm still fails as before.
+    if let Some(rest) = line.strip_prefix("call void asm sideeffect \"\", \"\"()") {
+        let rest = rest.trim_start();
+        if rest.is_empty() || rest.starts_with('#') || rest.starts_with(',') {
+            return true;
+        }
+    }
     let Some(open) = line.find('(') else {
         return false;
     };

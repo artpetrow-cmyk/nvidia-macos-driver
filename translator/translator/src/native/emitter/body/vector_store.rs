@@ -902,9 +902,16 @@ impl Emitter {
                     ))
                 }
             };
+            // ss1 (NullMoth dev): device buffers too (UniformConstant is the emitter's class for addrspace 1/2,
+            // made StorageBuffer later). Unity's skinning and blend-shape kernels store the first float of an
+            // `{ [N x i32] }` vertex record through the record's address, with no element index; the other elements
+            // already reach the same i32 element pointer through their own GEPs.
             if !matches!(
                 storage,
-                StorageClass::Function | StorageClass::Workgroup | StorageClass::Private
+                StorageClass::Function
+                    | StorageClass::Workgroup
+                    | StorageClass::Private
+                    | StorageClass::UniformConstant
             ) {
                 return Ok(false);
             }
