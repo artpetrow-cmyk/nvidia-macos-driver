@@ -138,12 +138,14 @@ static int nvmtl_skip_empty_on(void) {
     memset(&_c, 0, sizeof(_c));
     part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
     // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
-    // ss1: on by default in every process but WindowServer (its frames already wait in commitAndWaitUntilSubmitted):
-    // iconservicesagent handed iconservicesd renders before the GPU had drawn them, and the cached icons were bare glass
-    // plates. NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0 turns it off, =2 applies it to WindowServer too.
+    // ss1: on by default only in iconservicesagent, whose renders reached iconservicesd before the GPU had drawn them (the
+    // cached icons were bare glass plates). Everywhere else upstream's default (off) stands: held for every buffer that
+    // writes a surface, CoreAnimation in Safari's GPU process waited in waitUntilScheduled for each layer flush (34 % of its
+    // queue, a web map stuttering). NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=1 turns it on outside WindowServer, =2 there too,
+    // =0 off everywhere.
     static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES");
-        const int ws = getprogname() && !strcmp(getprogname(), "WindowServer");
-        after = (e && e[0] == '0') ? 0 : (e && e[0] == '2') ? 1 : !ws;
+        const char *pn = getprogname(); const int ws = pn && !strcmp(pn, "WindowServer");
+        after = (e && e[0] == '0') ? 0 : (e && e[0] == '2') ? 1 : (e && e[0] == '1') ? !ws : (pn && !strcmp(pn, "iconservicesagent"));
         nvlog("ss1: scheduled after IOSurface writes %s (NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=%s)", after ? "ON" : "off", e ? e : "unset"); }
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
     for (NVMTLTexture *s in part->surfaces) if (after && s != drawable) _scheduleAfterPublish = YES;
