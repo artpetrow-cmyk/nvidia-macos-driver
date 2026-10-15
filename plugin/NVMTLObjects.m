@@ -163,6 +163,23 @@ __attribute__((constructor(101))) static void nvmtl_conf_knobs(void)
     // place the trace flags live; a sandboxed agent's container T/ is writable by its user). Its NVMTL_/NVK_/NVRM_ keys
     // win over the conf - bisecting a bug in one agent (iconservicesagent) without sudo and without touching the others.
     unsigned over = 0;
+    // knob2: the same per-program file beside the conf, /Library/GPUBundles/nvmtl/nvmtl-knobs.<program name> - written by
+    // an administrator, kept across reboots (the temporary directory below is emptied at every boot). Read first, so a
+    // knob1 file still wins for an experiment. Valheim keeps its robustBufferAccess off and GFXP preemption this way.
+    { char q[1200]; snprintf(q, sizeof q, "/Library/GPUBundles/nvmtl/nvmtl-knobs.%s", getprogname() ? getprogname() : "?");
+      FILE *g = fopen(q, "r"); unsigned took2 = 0;
+      while (g && fgets(line, sizeof line, g)) {
+          char *p = line; while (*p == ' ' || *p == '\t') p++;
+          if (*p == '#' || *p == '\n' || !*p) continue;
+          char *eq = strchr(p, '='); if (!eq) continue; *eq = 0;
+          char *key = p, *val = eq + 1, *end = key + strlen(key);
+          while (end > key && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+          end = val + strlen(val);
+          while (end > val && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+          if (strncmp(key, "NVMTL_", 6) && strncmp(key, "NVK_", 4) && strncmp(key, "NVRM_", 5)) continue;
+          if (setenv(key, val, 1) == 0) took2++;
+      }
+      if (g) { fclose(g); nvlog("conf: knob2 %u setting(s) from %s", took2, q); } }
     { char t[1024]; size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, t, sizeof t);
       char q[1200]; FILE *g = (n > 0 && n < sizeof t && snprintf(q, sizeof q, "%snvmtl-knobs.%s", t, getprogname()) > 0) ? fopen(q, "r") : NULL;
       while (g && fgets(line, sizeof line, g)) {

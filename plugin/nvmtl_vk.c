@@ -976,8 +976,12 @@ static int nvmtl_vk_initialize(void)
     // Metal apps read past buffer ends and Apple GPUs tolerate it; on NVK an unchecked load off the end of a
     // mapping is an MMU FAULT_PTE that kills the channel (WoW at the login screen). Bounds-checked buffer and
     // vertex-fetch access turns those reads into zeros instead.
-    enabled.robustBufferAccess = supported.robustBufferAccess;
-    nvlog("vk: robustBufferAccess %s", supported.robustBufferAccess ? "ON (out-of-range buffer reads return zeros)" : "ABSENT - out-of-range buffer reads can fault the channel");
+    // rb1: NVMTL_ROBUST_BUFFERS=0 leaves it off for one process (a knob file or the conf): the checks sit in every shader
+    // buffer access, and a game that never reads past its buffers (Valheim on 1.15 had none) pays for them in GPU time.
+    { const char *e = getenv("NVMTL_ROBUST_BUFFERS"); const int off = e && e[0] == '0';
+      enabled.robustBufferAccess = off ? VK_FALSE : supported.robustBufferAccess;
+      nvlog("vk: robustBufferAccess %s", off ? "OFF (NVMTL_ROBUST_BUFFERS=0) - out-of-range buffer reads can fault the channel"
+            : supported.robustBufferAccess ? "ON (out-of-range buffer reads return zeros)" : "ABSENT - out-of-range buffer reads can fault the channel"); }
     g_sampler_anisotropy = supported.samplerAnisotropy == VK_TRUE;
     nvlog("vk: sampler anisotropy %d (max %g), mirror-clamp-to-edge %d", g_sampler_anisotropy,
           (double)g_lim.maxSamplerAnisotropy, g_sampler_mirror_clamp);
