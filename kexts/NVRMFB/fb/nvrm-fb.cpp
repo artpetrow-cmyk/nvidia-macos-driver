@@ -491,8 +491,14 @@ static volatile bool gConsoleReleased = false;
 //     waitFlipDone sees it turn from pending to done (woken by the flip-occurred event), and the middle of that step is kept.
 //   debug.nvrmfb_flip_unlocked_wait (on; boot-arg nvfbflipwait=0 turns it off): a pure flip waits for its latch outside the display
 //     gate, so one head's wait for its vblank no longer holds up the other head's flips and every VRAM grant/release.
-static int gVblLock = 1, gFlipUnlockedWait = 1;
-static volatile SInt64 gCntVblLocked, gCntVblNoLatch, gCntLatchSeen, gCntFlipUnlocked, gCntFlipWaitFallback;
+//   debug.nvrmfb_vbl_offset_us (vbo1, default 0): the locked VBL comes this long after the latch instead of on it. The swap's
+//     completion reaches WindowServer only once the flip waiter has seen the latch and NVAccel has signalled it; a VBL on the
+//     latch itself comes before that, and WindowServer then skips the refresh (a window being moved got about half of them).
+//     debug.nvrmfb_vbl_inflight counts VBL ticks delivered while this head's previous flip was still being waited for.
+static int gVblLock = 1, gFlipUnlockedWait = 1, gVblOffsetUs = 0;
+static volatile SInt64 gCntVblLocked, gCntVblNoLatch, gCntLatchSeen, gCntFlipUnlocked, gCntFlipWaitFallback, gCntVblInFlight;
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vbl_offset_us, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblOffsetUs, 0, "vbo1: the locked VBL comes this many us after the flip latch (0 = on it)");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vbl_inflight, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntVblInFlight, "vbo1: VBL ticks delivered while the head's previous flip was still waited for");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vbl_lock, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblLock, 0, "1 = the timer VBL is re-phased to the last flip latch");
 SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_unlocked_wait, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipUnlockedWait, 0, "1 = pure flips wait for their latch outside the display gate");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vbl_locked, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntVblLocked, "VBL ticks scheduled from a flip latch");
@@ -2067,7 +2073,9 @@ void NVRMNVDAFramebuffer::vblFire(thread_call_param_t p0, thread_call_param_t)
     }
     {   uint64_t nowv = 0; clock_get_uptime(&nowv); const uint64_t per = me->vblPeriodAbs();
         const bool hwLive = me->fHwVblLast && nowv - me->fHwVblLast < 2 * per;
-        if (!hwLive && me->fVbl.proc) { me->fVbl.proc(me->fVbl.target, me->fVbl.ref); me->fVblCalls++; } }
+        if (!hwLive && me->fVbl.proc) {
+            if (me->fFlipInFlight) OSAddAtomic64(1, &gCntVblInFlight);   // vbo1: the swap before this tick is not complete yet
+            me->fVbl.proc(me->fVbl.target, me->fVbl.ref); me->fVblCalls++; } }
     uint64_t period = 0, now = 0;
     period = me->vblPeriodAbs();
     clock_get_uptime(&now);
@@ -2089,7 +2097,11 @@ uint64_t NVRMNVDAFramebuffer::vblLockedNext(uint64_t now, uint64_t period)
     const uint64_t at = fLatchAt;
     uint64_t window = 0; nanoseconds_to_absolutetime(2000000000ull, &window);
     if (!at || at > now || now - at > window) { OSAddAtomic64(1, &gCntVblNoLatch); return 0; }
-    uint64_t next = at + ((now - at) / period + 1) * period;
+    // vbo1: the tick's phase is the latch plus the offset (taken modulo the period)
+    uint64_t off = 0; const int us = gVblOffsetUs;
+    if (us > 0) { nanoseconds_to_absolutetime((uint64_t)(us > 50000 ? 50000 : us) * 1000ull, &off); off %= period; }
+    const uint64_t ph = at + off;
+    uint64_t next = ph > now ? ph : ph + ((now - ph) / period + 1) * period;
     if (next - now < period / 2) next += period;
     if (OSAddAtomic64(1, &gCntVblLocked) == 0)
         FBLOG("VBL on head %u now keeps the phase of its flip latches (next in %llu abs, period %llu)", fHead, next - now, period);
@@ -3112,6 +3124,7 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_transient); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_transient_bytes);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_transient_grants); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_transient_refused);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vbl_lock); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_unlocked_wait);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vbl_offset_us); sysctl_register_oid(&sysctl__debug_nvrmfb_vbl_inflight);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vbl_locked); sysctl_register_oid(&sysctl__debug_nvrmfb_vbl_no_latch);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vbl_latch_seen);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_unlocked); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_wait_fallback);
