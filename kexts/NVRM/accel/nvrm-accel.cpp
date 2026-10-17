@@ -1417,6 +1417,8 @@ static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS;
 SYSCTL_PROC(_debug, OID_AUTO, nvaccel_crc, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_crc_sysctl, "I",
             "b85k-crc: display CRC32 of what head nvaccel_crc_head is showing (0 = unavailable)");
 extern struct sysctl_oid sysctl__debug_nvaccel_vic, sysctl__debug_nvaccel_vic_queries, sysctl__debug_nvaccel_vic_novram;   // vic1, defined with the surfvram code
+extern struct sysctl_oid sysctl__debug_nvaccel_ftm, sysctl__debug_nvaccel_ftm_reset;   // ftm1, defined with the async flip code
+extern struct sysctl_oid sysctl__debug_nvaccel_sv_rewire, sysctl__debug_nvaccel_sv_rewired, sysctl__debug_nvaccel_sv_rewire_other;   // rw1
 static bool gSysctlInstalled = false;
 static void nvaccelInstallSysctl(void)
 {
@@ -1467,6 +1469,9 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_timeouts); sysctl_register_oid(&sysctl__debug_nvaccel_surface_gpu_wait_max_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_refused); sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_drop);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_late);
+    sysctl_register_oid(&sysctl__debug_nvaccel_ftm); sysctl_register_oid(&sysctl__debug_nvaccel_ftm_reset);   // ftm1
+    sysctl_register_oid(&sysctl__debug_nvaccel_sv_rewire); sysctl_register_oid(&sysctl__debug_nvaccel_sv_rewired);   // rw1
+    sysctl_register_oid(&sysctl__debug_nvaccel_sv_rewire_other);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h0);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h1);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h2);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h3);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
@@ -1724,6 +1729,11 @@ static bool nvSVDiag() { return gSVDiag > 0 && OSDecrementAtomic(&gSVDiag) > 0; 
 // 2 no NVResource, 3 no NVVidMemory, 4 vidmem without an RM handle, 5 resource type not 0xc0, 6 resource flag 0x8000,
 // 7 no valid-bits array, 8 plane > 15, 9 pending table refused.
 static SInt64 gNVSVWhy[10];
+static int gSVRewire = 1;
+static SInt64 gCntSVRewired, gCntSVRewireOther;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_sv_rewire, CTLFLAG_RW | CTLFLAG_LOCKED, &gSVRewire, 0, "rw1: 1 = a dirty mark on a deallocated surface wires its parked VRAM back");
+NVACCEL_CNT(nvaccel_sv_rewired,      gCntSVRewired,     "rw1: dirty marks that wired a surface's parked VRAM back (then accepted)");
+NVACCEL_CNT(nvaccel_sv_rewire_other, gCntSVRewireOther, "rw1: wires that did not return the parked VRAM (mark refused)");
 static int nvaccel_svdirty_why_sysctl SYSCTL_HANDLER_ARGS
 {
 #pragma unused(arg1, arg2)
@@ -1813,6 +1823,19 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
         return kIOReturnSuccess;
     }
     if (cmd == NVRM_ESC_SURF_DIRTY) {
+        // rw1: a surface the family paged off and deallocated keeps its VRAM parked (vm_sticky), and the plugin goes on
+        // drawing into that VRAM through the import it made before. Refused here (reason 4), every later publication of
+        // the surface was a full CPU readback: WindowServer's display surfaces, paged off once at login, were read back
+        // ~7 times a second (170 MB/s of memmove on its submission thread; window moves fell to 50 frames a second).
+        // The GPU has just written the surface, which is when the family would wire it again: wire it here, as the
+        // import path below does, and accept the mark only if what came back is the parked VRAM the plugin draws into.
+        if (cache && res && vm && !vm->fRmHandle && !vm->fScanout && vm->fParkHandle && gSVRewire) {
+            void *const parked = vm->fParkHandle;
+            _ZN16IOAccelVidMemory4wireEv(vm);
+            if (vm->fRmHandle == parked) OSAddAtomic64(1, &gCntSVRewired);
+            else { OSAddAtomic64(1, &gCntSVRewireOther); p->status = NVRM_SS_NO_VRAM;
+                   if (cache) ((OSObject *)cache)->release(); nvFamUnlock(a); ((OSObject *)surf)->release(); return kIOReturnSuccess; }
+        }
         int why = !cache ? 1 : !res ? 2 : !vm ? 3 : !vm->fRmHandle ? 4 : 0;
         p->status = why ? NVRM_SS_NO_CACHE : nvAccelSurfDirty(cache, res, plane, &why);
         if (p->status == 0) gNVSVDirty++; else gNVSVDirtyRefused++;
@@ -2073,7 +2096,45 @@ int thread_call_enter(struct thread_call *call);
 // next/nextF: one frame WindowServer presented while the previous flip was still in flight past the bound, taken by
 // the worker as soon as that flip lands (guarded by gIopAsLock, like busy's clearing).
 struct NVIopAsync { void *pipe; IOService *fb; IOSurface *s; struct NVRMFlipRequest f; volatile SInt32 busy; struct thread_call *call;
-                    IOSurface *next; struct NVRMFlipRequest nextF; };
+                    IOSurface *next; struct NVRMFlipRequest nextF; uint64_t tSwap, tNext; };
+// ftm1: where a WindowServer frame's time goes on the zero-copy path, per head, in 1 ms buckets (32 = 32 ms or more):
+// 0 swap-to-swap interval, 1 WindowServer's thread held in the swap by the flip still in flight, 2 swap to worker start,
+// 3 worker waiting for the composite's GPU completion mark, 4 flip submit to latch (nvFlipToSurfacePure), 5 swap to
+// the transaction's completion signal. Read: sysctl debug.nvaccel_ftm; write 1 to debug.nvaccel_ftm_reset to clear.
+static const unsigned kFtmKinds = 6, kFtmBuckets = 33;
+static volatile SInt32 gFtm[2][kFtmKinds][kFtmBuckets];
+static uint64_t gFtmLastSwap[2];
+static void nvFtm(unsigned head, unsigned kind, uint64_t fromAbs, uint64_t toAbs)
+{
+    if (head >= 2 || kind >= kFtmKinds || !fromAbs || toAbs < fromAbs) return;
+    uint64_t ns = 0; absolutetime_to_nanoseconds(toAbs - fromAbs, &ns);
+    const uint64_t ms = ns / 1000000ull;
+    OSIncrementAtomic(&gFtm[head][kind][ms < kFtmBuckets - 1 ? ms : kFtmBuckets - 1]);
+}
+static int nvaccel_ftm_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+    static const char *const nm[kFtmKinds] = { "swap-interval", "ws-held", "to-worker", "gpu-wait", "flip-latch", "swap-to-done" };
+    char b[2400]; int n = 0;
+    for (unsigned h = 0; h < 2; h++) for (unsigned k = 0; k < kFtmKinds; k++) {
+        n += snprintf(b + n, sizeof b - (size_t)n, "h%u %-13s", h, nm[k]);
+        for (unsigned i = 0; i < kFtmBuckets && n < (int)sizeof b - 16; i++) n += snprintf(b + n, sizeof b - (size_t)n, " %d", (int)gFtm[h][k][i]);
+        n += snprintf(b + n, sizeof b - (size_t)n, "\n");
+        if (n >= (int)sizeof b - 16) break;
+    }
+    return sysctl_handle_string(oidp, b, n + 1, req);
+}
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_ftm, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_ftm_sysctl, "A",
+            "ftm1: per-head ms histograms: swap interval, WindowServer held, to worker, GPU wait, flip to latch, swap to done");
+static int gFtmReset;
+static int nvaccel_ftm_reset_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+    const int err = sysctl_handle_int(oidp, &gFtmReset, 0, req);
+    if (!err && req->newptr && gFtmReset) { for (unsigned h = 0; h < 2; h++) for (unsigned k = 0; k < kFtmKinds; k++) for (unsigned i = 0; i < kFtmBuckets; i++) gFtm[h][k][i] = 0; gFtmReset = 0; }
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_ftm_reset, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, nvaccel_ftm_reset_sysctl, "I", "ftm1: write 1 to clear the histograms");
 static NVIopAsync gIopAs[kNvMaxFB];
 static SInt32 gIopAsyncRefuseRun;
 // WindowServer's next present waits here while the previous asynchronous flip is still on its way to the panel. It
@@ -2110,11 +2171,17 @@ static void nvAccelIopAsyncRun(void *p0, void *)
     NVIopAsync *e = (NVIopAsync *)p0;
     const unsigned head = (unsigned)(e - gIopAs);
     IOSurface *s = e->s; e->s = nullptr;
+    uint64_t tSwap = e->tSwap;
   again:
+    const uint64_t tStart = mach_absolute_time();
+    nvFtm(head, 2, tSwap, tStart);
     nvSurfWaitReady(s->getSurfaceID());   // WindowServer did not wait for this composite; the flip does, off its thread
+    const uint64_t tReady = mach_absolute_time();
+    nvFtm(head, 3, tStart, tReady);
     const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
     IOReturn rr = sym ? e->fb->callPlatformFunction(sym, false, &e->f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
     if (sym) sym->release();
+    nvFtm(head, 4, tReady, mach_absolute_time());
     const int outcome = nvAccelFlipOutcome(rr);
     if (outcome == kNvFlipShown) {
         gIopAsyncRefuseRun = 0;
@@ -2143,6 +2210,8 @@ static void nvAccelIopAsyncRun(void *p0, void *)
         IOLockLock(gIopAsLock);
         queued = e->next; e->next = nullptr;
         if (queued) { for (unsigned i = 0; i < sizeof e->f; i++) ((volatile unsigned char *)&e->f)[i] = ((const volatile unsigned char *)&e->nextF)[i]; }
+        nvFtm(head, 5, tSwap, mach_absolute_time());
+        if (queued) tSwap = e->tNext;
         else { __atomic_store_n(&e->busy, 0, __ATOMIC_RELEASE); IOLockWakeup(gIopAsLock, (event_t)&e->busy, false); }
         IOLockUnlock(gIopAsLock);
     } else {
@@ -2155,6 +2224,8 @@ static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSur
 {
     NVIopAsync *e = &gIopAs[head];
     if (!gIopAsLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gIopAsLock)) IOLockFree(l); }
+    const uint64_t tSwap = mach_absolute_time();
+    if (head < 2) { nvFtm(head, 0, gFtmLastSwap[head], tSwap); gFtmLastSwap[head] = tSwap; }
     if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE)) {
         uint64_t end = 0; clock_interval_to_deadline((uint32_t)nvAccelFlipWaitUs(fb), kMicrosecondScale, &end);
         while (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE) && mach_absolute_time() < end) {
@@ -2174,9 +2245,10 @@ static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSur
         if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE) && e->pipe == pipe && e->fb == fb) {
             IOSurface *old = e->next;
             ((OSObject *)s)->retain();
-            e->next = s;
+            e->next = s; e->tNext = tSwap;
             for (unsigned i = 0; i < sizeof *f; i++) ((volatile unsigned char *)&e->nextF)[i] = ((const unsigned char *)f)[i];
             IOLockUnlock(gIopAsLock);
+            nvFtm(head, 1, tSwap, mach_absolute_time());
             if (old) { OSAddAtomic64(1, &gCntIopAsyncDrop); ((OSObject *)old)->release(); }
             return true;
         }
@@ -2188,8 +2260,9 @@ static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSur
     }
     if (!e->call) e->call = thread_call_allocate(nvAccelIopAsyncRun, e);
     if (!e->call) return false;
+    nvFtm(head, 1, tSwap, mach_absolute_time());
     ((OSObject *)s)->retain();
-    e->pipe = pipe; e->fb = fb; e->s = s;
+    e->pipe = pipe; e->fb = fb; e->s = s; e->tSwap = tSwap;
     for (unsigned i = 0; i < sizeof *f; i++) ((volatile unsigned char *)&e->f)[i] = ((const unsigned char *)f)[i];
     __atomic_store_n(&e->busy, 1, __ATOMIC_RELEASE);
     thread_call_enter(e->call);
