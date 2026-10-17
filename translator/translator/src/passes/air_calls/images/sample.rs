@@ -229,7 +229,10 @@ pub(in crate::passes) fn lower_sample(
              the gradient the call carries"
         ));
     }
-    if is_int_tex {
+    // ic1: a cube has no texel fetch in SPIR-V; an integer cube is sampled as it is (Vulkan samples integer formats with a
+    // nearest filter - Metal allows nothing else on them). ANGLE's stencil blits sample a uint cube in one switch arm, and the
+    // whole shader was refused for it (blitStencilToBufferCS, blitDepthStencilFS and four more).
+    if is_int_tex && !matches!(dim, Dim::DimCube) {
         if let Some(sampler_state) = ctx.sampler_states.get(&samp).copied() {
             let lod = match find_sample_lod(ctx, arrayed, args, &mut out) {
                 Some(lod) => sample_lod_to_fetch_lod(ctx, lod, &mut out)?,
