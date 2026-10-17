@@ -112,7 +112,10 @@ static _Atomic uint64_t gRes2Tick;
 static void nvmtl_res2_note_use(NVMTLTexture *t);
 static uint64_t nvmtl_res2_evict(uint64_t want);
 extern uint64_t (*nvmtl_res2_evict_hook)(uint64_t want);
-__attribute__((constructor)) static void nvmtl_conf_knobs(void)
+// cf1: runs before every other constructor of the plugin (priority 101). nvmtl_angle_allow_nvidia, a constructor defined
+// earlier in the same translation unit, reads NVMTL_ANGLE_METAL at load: with the default order it ran before the conf was
+// applied, so NVMTL_ANGLE_METAL=1 in nvrm610.conf never reached Chrome, Edge or Electron.
+__attribute__((constructor(101))) static void nvmtl_conf_knobs(void)
 {
 #if NVMTL_RELEASE
     { extern char **environ; char *names[256]; unsigned n = 0;
