@@ -26,10 +26,33 @@
 static _Atomic unsigned gsub_inflight;
 static _Atomic unsigned long long gsub_ahead, gsub_peak;
 static NSMutableArray *nvmtl_quarantined_parts;
+// cah1: the execution pump holds g_pump_mx while it advances a command buffer and lets go of it only for the GPU wait of
+// a part it submitted ahead. A commit that finds it free submits ahead itself: WindowServer's display pipe
+// (CoreDisplay::DisplaySurface::AccessComplete -> commitAndWaitUntilSubmitted) waited for the pump to come out of the
+// wait for the frame's composite, i.e. for the GPU to finish it - 860 ms of every 8 s on WindowServer's main thread, and
+// a window with glass (System Settings) moved at well under the panel rate. The part being waited for was submitted
+// ahead, so the pass cannot reach it (its buffer's _nextSubmit is past it), and GPU order stays the queue's order.
+// On by default in WindowServer only. A process that draws IOSurfaces for another one reports "scheduled" sooner with it,
+// and with no GPU ordering between processes' channels the consumer can read a surface the producer's GPU has not
+// finished: a web app's list view in Safari flickered with half-drawn tiles (the screenshot, a later frame, was clean).
+// WindowServer's own surfaces are held by its completion marks. NVMTL_COMMIT_AHEAD=1 turns it on elsewhere, =0 off.
+static pthread_mutex_t g_pump_mx = PTHREAD_MUTEX_INITIALIZER;
+static __thread int t_pump_holds;
+static BOOL nvmtl_commit_ahead_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_COMMIT_AHEAD"), *pn = getprogname();
+        on = e ? (e[0] != '0') : (pn && !strcmp(pn, "WindowServer"));
+        nvlog("cah1: commits submit ahead while the pump waits for the GPU %s (NVMTL_COMMIT_AHEAD=%s)", on ? "ON" : "off", e ? e : "unset"); }
+    return on == 1;
+}
+static _Atomic unsigned long long g_cah_runs;
 static int nvmtl_gsub_finish(NVMTLSubmissionPart *part) {
     nvmtl_inflight *const f = part->inflight;
     part->inflight = NULL;
+    const int rel = t_pump_holds;
+    if (rel) { t_pump_holds = 0; pthread_mutex_unlock(&g_pump_mx); }
     const int r = nvmtl_vk_submit_finish(f);
+    if (rel) { pthread_mutex_lock(&g_pump_mx); t_pump_holds = 1; }
     atomic_fetch_sub(&gsub_inflight, 1);
     if (r == 0) nvmtl_vk_inflight_free(f);
     return r;
@@ -861,6 +884,13 @@ static void nvmtl_gsub_ahead_pass1(void) {
         nvmtl_su_acquire(self);
         if (!nvmtl_pending_buffers) nvmtl_pending_buffers = [NSMutableArray new];
         [nvmtl_pending_buffers addObject:self];
+        // cah1: never blocks (trylock under the class lock): a pump that is not in a GPU wait submits on its own shortly
+        if (nvmtl_gsub_ahead_on() && nvmtl_commit_ahead_on() && pthread_mutex_trylock(&g_pump_mx) == 0) {
+            nvmtl_gsub_ahead_pass();
+            pthread_mutex_unlock(&g_pump_mx);
+            const unsigned long long n = atomic_fetch_add(&g_cah_runs, 1) + 1;
+            if (n == 1 || (n & (n - 1)) == 0 && n >= 1024) nvlog("cah1: %llu commits ran the submit-ahead pass themselves", n);
+        }
         nvmtl_pump_buffers();
     }
 }
@@ -919,7 +949,10 @@ static void nvmtl_pump_buffers(void) {
                         eligible = reservations.firstObject == cb->_reservation;
                     }
                     if (!eligible) continue;
+                    const BOOL cah = nvmtl_commit_ahead_on();
+                    if (cah) { pthread_mutex_lock(&g_pump_mx); t_pump_holds = 1; }
                     if ([cb nvmtlAdvancePart]) progress = YES;
+                    if (cah) { t_pump_holds = 0; pthread_mutex_unlock(&g_pump_mx); }
                     @synchronized ([NVMTLCommandBuffer class]) {
                         if (cb->_executionDone) {
                             [cb nvmtlReleaseReservation];
