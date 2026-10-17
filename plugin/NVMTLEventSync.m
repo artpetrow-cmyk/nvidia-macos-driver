@@ -259,6 +259,81 @@ static void nvmtl_ws_mark_ready(NVMTLCommandBuffer *cb) {
     objc_setAssociatedObject(cb, nvmtl_ws_marks_key, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     (void)nvmtl_ws_publish_settled(settled, nil);
 }
+// dp1: a drawable presented with [drawable present] (or AtTime:/AfterMinimumDuration:/WithOptions:) instead of
+// -[MTLCommandBuffer presentDrawable:] reaches the display only after the GPU has written it. Unity (Valheim) commits,
+// waits until scheduled and then calls [drawable present]: with ss1 off "scheduled" comes at submission, WindowServer
+// composited the drawable before the frame was drawn and showed what it held three frames earlier - the picture jumped
+// back and forth when running, menu highlights flickered under the mouse. With ss1 on (scheduled only after the writes)
+// the frames were right but the game waited for every frame (fps down by a quarter). Apple's GPUs order the display
+// after the writer; here the present itself waits: CAMetalDrawable's present methods are replaced (not in WindowServer),
+// and a present whose drawable an unfinished command buffer writes runs when that buffer finishes, from its completion.
+// The app never waits. A layer with presentsWithTransaction keeps the original call (its present belongs to a CA
+// transaction). NVMTL_PRESENT_AFTER_WRITES=0 turns it off.
+static _Atomic unsigned long long gDp1Deferred, gDp1Direct;
+static void nvmtl_dp1_census(void) {
+    const unsigned long long d = atomic_load(&gDp1Deferred), n = d + atomic_load(&gDp1Direct);
+    if (n & (n - 1)) return;
+    nvlog("dp1: %llu drawable presents, %llu of them waited for the GPU writes of their drawable", n, d);
+}
+static BOOL nvmtl_dp1_defer(NVMTLTexture *t, dispatch_block_t present) {
+    if (!t || !t->_surf) return NO;
+    @synchronized ([NVMTLCommandBuffer class]) {
+        NSString *key = nvmtl_surface_writer_key(t);
+        for (id queue in nvmtl_surface_writers.keyEnumerator) {
+            NVMTLPendingSurfaceWrite *write = [nvmtl_surface_writers objectForKey:queue][key];
+            NVMTLCommandBuffer *writer = write ? write->buffer : nil;
+            if (!writer || writer->_presentsClosed) continue;
+            if (!writer->_latePresents) writer->_latePresents = [NSMutableArray new];
+            [writer->_latePresents addObject:[present copy]];
+            return YES;
+        }
+    }
+    return NO;
+}
+static IMP gDp1Present, gDp1AtTime, gDp1AfterMin, gDp1WithOptions;
+static void nvmtl_dp1_go(id drawable, int kind, double arg, id options) {
+    NVMTLTexture *t = nil;
+    id layer = [drawable respondsToSelector:@selector(layer)] ? [drawable layer] : nil;
+    if (!(layer && [layer respondsToSelector:@selector(presentsWithTransaction)] && [(CAMetalLayer *)layer presentsWithTransaction])) {
+        SEL cached = sel_registerName("cachedTexture");   // the texture CA already made; texture would make one
+        id tex = [drawable respondsToSelector:cached] ? ((id (*)(id, SEL))objc_msgSend)(drawable, cached)
+                                                      : [(id<CAMetalDrawable>)drawable texture];
+        if ([tex isKindOfClass:[NVMTLTexture class]]) t = tex;
+    }
+    if (t && nvmtl_dp1_defer(t, ^{ nvmtl_dp1_go(drawable, kind, arg, options); })) {
+        atomic_fetch_add(&gDp1Deferred, 1); nvmtl_dp1_census(); return;
+    }
+    if (t) { atomic_fetch_add(&gDp1Direct, 1); nvmtl_dp1_census(); }
+    switch (kind) {
+        case 0: ((void (*)(id, SEL))gDp1Present)(drawable, @selector(present)); break;
+        case 1: ((void (*)(id, SEL, double))gDp1AtTime)(drawable, @selector(presentAtTime:), arg); break;
+        case 2: ((void (*)(id, SEL, double))gDp1AfterMin)(drawable, @selector(presentAfterMinimumDuration:), arg); break;
+        default: ((void (*)(id, SEL, id))gDp1WithOptions)(drawable, @selector(presentWithOptions:), options); break;
+    }
+}
+static void nvmtl_dp1_present(id self, SEL _cmd) { nvmtl_dp1_go(self, 0, 0, nil); }
+static void nvmtl_dp1_present_at(id self, SEL _cmd, double t) { nvmtl_dp1_go(self, 1, t, nil); }
+static void nvmtl_dp1_present_after(id self, SEL _cmd, double d) { nvmtl_dp1_go(self, 2, d, nil); }
+static void nvmtl_dp1_present_options(id self, SEL _cmd, id o) { nvmtl_dp1_go(self, 3, 0, o); }
+void nvmtl_dp1_install(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("NVMTL_PRESENT_AFTER_WRITES"), *pn = getprogname();
+        if ((e && e[0] == '0') || (pn && !strcmp(pn, "WindowServer"))) {
+            nvlog("dp1: drawable presents are not deferred (NVMTL_PRESENT_AFTER_WRITES=%s, %s)", e ? e : "unset", pn ? pn : "?"); return; }
+        Class c = NSClassFromString(@"CAMetalDrawable");
+        Method m0 = c ? class_getInstanceMethod(c, @selector(present)) : NULL;
+        Method m1 = c ? class_getInstanceMethod(c, @selector(presentAtTime:)) : NULL;
+        Method m2 = c ? class_getInstanceMethod(c, @selector(presentAfterMinimumDuration:)) : NULL;
+        Method m3 = c ? class_getInstanceMethod(c, @selector(presentWithOptions:)) : NULL;
+        if (!m0 || !m1 || !m2) { nvlog("dp1: CAMetalDrawable present methods not found - presents are not deferred"); return; }
+        gDp1Present = method_setImplementation(m0, (IMP)nvmtl_dp1_present);
+        gDp1AtTime = method_setImplementation(m1, (IMP)nvmtl_dp1_present_at);
+        gDp1AfterMin = method_setImplementation(m2, (IMP)nvmtl_dp1_present_after);
+        if (m3) gDp1WithOptions = method_setImplementation(m3, (IMP)nvmtl_dp1_present_options);
+        nvlog("dp1: drawable presents wait for the GPU writes of their drawable (%s presentWithOptions:)", m3 ? "with" : "without");
+    });
+}
 static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
     nvmtl_ws_mark_ready(cb);
     @synchronized ([NVMTLCommandBuffer class]) {
@@ -498,10 +573,15 @@ static void nvmtl_su_release(NVMTLCommandBuffer *cb) {
             [nvmtl_quarantined_parts addObject:p];
         }
     }
+    // dp1: from here a present of a drawable this buffer wrote runs at once; the ones that came in while it ran go now,
+    // error or not (the app asked for them, and CoreAnimation gets the drawable back only through a present or release)
+    NSArray *late;
+    @synchronized ([NVMTLCommandBuffer class]) { _presentsClosed = YES; late = _latePresents; _latePresents = nil; }
     if (!error) {
         for (dispatch_block_t action in _presentations) action();
     }
     [_presentations removeAllObjects]; _present = nil;
+    for (dispatch_block_t present in late) present();
     double deviceStart = 0, deviceEnd = 0;
     if (!error && _gpuTimingSeen && !_gpuTimingInvalid)
         (void)nvmtl_vk_interval_seconds(&_gpuTiming, &deviceStart, &deviceEnd);
