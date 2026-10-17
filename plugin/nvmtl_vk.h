@@ -8,9 +8,10 @@
 #include <stdint.h>
 #include <stddef.h>
 const char *nvmtl_image_ident(const void *addr, char *out, size_t n);
-typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; } nvk_buffer;
+typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; void *vic; } nvk_buffer;   // vic: the kept VRAM import mem belongs to (vic1)
 #include "nvmtl_sample_positions.h"
-typedef struct { void *img; void *mem; void *view; uint32_t w, h; size_t alloc; uint32_t layout; uint32_t mips; uint32_t fmt, bpp; uint32_t storage, mtl_type, layers; int placed; uint32_t bw, bh; uint32_t samples; uint32_t sysmem; uint32_t vkflags, usage;  uint32_t vpair;  uint64_t up_token; } nvk_image;
+typedef struct { void *img; void *mem; void *view; uint32_t w, h; size_t alloc; uint32_t layout; uint32_t mips; uint32_t fmt, bpp; uint32_t storage, mtl_type, layers; int placed; uint32_t bw, bh; uint32_t samples; uint32_t sysmem; uint32_t vkflags, usage;  uint32_t vpair;  uint64_t up_token; 
+                  uint32_t pitch, boff, sid, fetched;  } nvk_image;   // lsh1: linear row pitch (0 = tiled), bind offset % 128, IOSurface ID, [[color(n)]] read it
 #define NVMTL_NVAR 16
 #define NVMTL_NVAR_MAX 4096
 #define NVMTL_NCOL 8
@@ -78,8 +79,18 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void *counter_recording; unsigned counter_error;
                  nvmtl_sample_pattern sample_pattern;
                  void **rvs; unsigned nrv, caprv;
+                 void *fbl_img[NVMTL_NCOL]; uint32_t fbl_ncol;   /* fbl1: the open pass's colour images, so a draw sampling one gets a barrier */
+                 void *lsh_tw[NVMTL_NCOL]; nvk_image *lsh_lin[NVMTL_NCOL]; uint32_t lsh_mask, lsh_stale; nvk_image *lsh_stale_img[NVMTL_NCOL];
+                 void **lsh_held; unsigned nlsh, caplsh; uint32_t lsh_shadow;
                } nvk_cmdbuf;
 int  nvmtl_vk_init(void);
+/* lsh1: colour targets of the pass in progress that are linear images NVK draws through its hidden tiled copy and that a
+   [[color(n)]] draw would read stale (bit per attachment); _mark remembers their images/surfaces and returns how many */
+uint32_t nvmtl_vk_fetch_stale(const nvk_cmdbuf *c);
+uint32_t nvmtl_vk_fetch_mark(nvk_cmdbuf *c);
+/* lsh2: colour targets of the pass in progress that are linear and drawn through a tiled copy (NVK's or lsh1's twin): a
+   texture read of one of them mid-pass sees the pixels the pass began with (fetch-using processes only) */
+uint32_t nvmtl_vk_pass_linear_shadowed(const nvk_cmdbuf *c);
 int nvmtl_vk_sample_positions_backend(void);
 int nvmtl_vk_sample_positions_default(uint32_t count, nvmtl_sample_pattern *out);
 int  nvmtl_vk_cmd_abandon(nvk_cmdbuf *c);
@@ -200,6 +211,12 @@ int nvmtl_vk_pre_open(void);
 int nvmtl_vk_pre_copy(nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
 int nvmtl_vk_pre_fill(nvk_buffer *b, size_t offset, size_t size, uint32_t word);
 void nvmtl_vk_pre_hold(void *retained);
+int nvmtl_vk_pre_upload(nvk_buffer *src, size_t off, nvk_image *img, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                        uint32_t level, uint32_t layer, size_t bytes);
+int nvmtl_vk_upload_now(nvk_buffer *src, size_t off, nvk_image *img, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                        uint32_t level, uint32_t layer);
+int nvmtl_vk_prologue_enabled(void);
+int nvmtl_vk_image_zero_now(nvk_image *img);
 extern void (*nvmtl_pre_release_hook)(void *);
 extern void (*nvmtl_pre_submit_hook)(void);
 int  nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes);
@@ -228,6 +245,19 @@ typedef struct { uint32_t patch_type, n, partition, winding, stepfn, scale_en, c
 int nvmtl_vk_pipeline_create_tess(const void *vs, size_t vn, const void *fs, size_t fn, uint32_t vkfmt, uint32_t depthfmt, const void *blend,
                                   const void *vin, uint32_t samples, const nvk_tess_desc *td, void *out);
 int nvmtl_spirv_tess_info(const void *spv, size_t bytes, uint32_t *patchType, uint32_t *cps);
+/* kstage2: a kernel's [[stage_in]] members (MTLComputePipelineDescriptor.stageInputDescriptor). Each member is a synthetic
+ * storage buffer at metal index `slot` - 16/8/4-byte elements indexed by the absolute grid x - filled before the dispatch
+ * by a generated gather kernel from the app's buffer `buffer` (format `fmt` = MTLAttributeFormat, `offset`, layout `stride`,
+ * step 0 constant / 5 thread position x / 7 x through the index buffer, `rate`). */
+#define NVMTL_STAGEIN_MAX 16
+typedef struct { uint32_t slot, loc, kind, comps, fmt, offset, buffer, stride, step, rate; } nvk_stagein_attr;
+typedef struct { uint32_t n, idx_type, idx_buffer; nvk_stagein_attr a[NVMTL_STAGEIN_MAX]; } nvk_stagein;
+typedef struct { uint8_t raw[48]; uint32_t had; } nvk_slot_saved;
+int nvmtl_vk_stagein_check(const nvk_stagein *si, char *why, size_t wl);
+uint32_t nvmtl_vk_stagein_elem_bytes(const nvk_stagein_attr *a);
+int nvmtl_vk_stagein_gather(nvk_cmdbuf *c, const nvk_stagein *si, uint32_t count, uint32_t lo, uint32_t hi,
+                            nvk_buffer *const *dst, const size_t *dstOff, nvk_slot_saved *saved);
+void nvmtl_vk_stagein_restore(nvk_cmdbuf *c, const nvk_stagein *si, const nvk_slot_saved *saved);
 typedef struct { uint32_t ncol, cfmt[NVMTL_NCOL]; nvk_blend_state blend[NVMTL_NCOL]; uint32_t dfmt, discard, a2c, a2one; } nvk_rt;
 typedef struct { nvk_image *col[NVMTL_NCOL]; void *colview[NVMTL_NCOL]; uint32_t colw[NVMTL_NCOL], colh[NVMTL_NCOL];
     nvk_image *res[NVMTL_NCOL]; void *resview[NVMTL_NCOL]; uint32_t resw[NVMTL_NCOL], resh[NVMTL_NCOL];
@@ -271,6 +301,7 @@ int  nvmtl_vk_image_gen_mipmaps(nvk_queue *q, nvk_image *img);
 int  nvmtl_vk_image_view_create(nvk_image *img, int bgra, uint32_t baseLevel, uint32_t levelCount, void **out_view);
 void nvmtl_vk_image_view_destroy(void *view);
 int  nvmtl_vk_bind_texture_view(nvk_cmdbuf *c, uint32_t set, uint32_t index, void *view);
+void nvmtl_vk_note_texture_image(nvk_cmdbuf *c, uint32_t set, uint32_t index, const nvk_image *img);
 int  nvmtl_vk_image_write_region_level(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes,
                                        uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level);
 int  nvmtl_vk_image_read_region_level(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes,
@@ -308,6 +339,10 @@ int  nvmtl_vk_image_view_create_range(nvk_image *img, uint32_t vkfmt, int a8, ui
 int  nvmtl_vk_image_view_create_range_aspect(nvk_image *img, uint32_t vkfmt, int a8, uint32_t aspect, uint32_t baseLevel, uint32_t levelCount, uint32_t baseLayer, uint32_t layerCount, uint32_t mtl_view_type, void **out_view);
 int  nvmtl_vk_image_write_region_level_layer(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level, uint32_t layer);
 int  nvmtl_vk_image_read_region_level_layer(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level, uint32_t layer);
+void nvmtl_vk_feedback_slots(nvk_cmdbuf *c, uint32_t set, const void *img, uint64_t m[2]);
+void *nvmtl_vk_slot_view(nvk_cmdbuf *c, uint32_t set, uint32_t index);
+uint64_t nvmtl_vk_slot_image(nvk_cmdbuf *c, uint32_t set, uint32_t index);
+void nvmtl_vk_slot_set_image(nvk_cmdbuf *c, uint32_t set, uint32_t index, uint64_t img);
 int  nvmtl_vk_cmd_copy_image_sub(nvk_cmdbuf *c, nvk_image *src, uint32_t sl, uint32_t ss, uint32_t sx, uint32_t sy, nvk_image *dst, uint32_t dl, uint32_t ds, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);
 int  nvmtl_vk_cmd_copy_image_sub3(nvk_cmdbuf *c, nvk_image *src, uint32_t sl, uint32_t ss, uint32_t sx, uint32_t sy, uint32_t sz, nvk_image *dst, uint32_t dl, uint32_t ds, uint32_t dx, uint32_t dy, uint32_t dz, uint32_t w, uint32_t h, uint32_t depth);
 int  nvmtl_vk_image_view_create_aspect(nvk_image *img, uint32_t vkfmt, uint32_t aspect, uint32_t baseLevel, uint32_t levelCount, void **out_view);

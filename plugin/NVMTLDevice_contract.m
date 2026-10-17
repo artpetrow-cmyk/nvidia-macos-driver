@@ -5,6 +5,8 @@
  */
 
 #import <Metal/Metal.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #import "NVMTLObjects.h"
 #import <IOSurface/IOSurfaceRef.h>
 @implementation NVMTLDevice (Contract)
@@ -64,6 +66,25 @@ static void nvbt(const char *tag, int *count, int max);
     }
     memcpy(b->_b.map, a0, a1);
     b->_hostPtr = a0; b->_hostLen = (size_t)a1;
+    // hpin1: the kernel refuses to wire these pages writable (os_lock_user_pages prepare -> KERN_PROTECTION_FAILURE): the
+    // caller handed us a read-only mapping (WindowServer wraps r--/r-- shared memory this way). The buffer is copied in at
+    // every submission; copying it BACK would write into read-only pages (a fault in WindowServer) or undo what the
+    // pages' owner wrote meanwhile, so a read-only mapping is never synced out. The first 8 per process are logged.
+    { BOOL ro = NO; int prot = -1, maxp = -1; kern_return_t kr = KERN_SUCCESS;
+      mach_vm_address_t at = (mach_vm_address_t)(uintptr_t)a0; const mach_vm_address_t end = at + a1;
+      while (at < end) {
+          mach_vm_address_t ra = at; mach_vm_size_t rs = 0; vm_region_basic_info_data_64_t ri; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
+          kr = mach_vm_region(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&ri, &cnt, &obj);
+          if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+          if (kr != KERN_SUCCESS || ra > at || !rs) { ro = YES; break; }
+          if (prot < 0) { prot = ri.protection; maxp = ri.max_protection; }
+          if (!(ri.protection & VM_PROT_WRITE)) { ro = YES; prot = ri.protection; maxp = ri.max_protection; break; }
+          at = ra + rs;
+      }
+      b->_hostRO = ro;
+      static _Atomic int said; if (said < 8) { said++;
+        nvlog("hpin1 newBufferWithBytesNoCopy: import refused for %lu bytes at %p (storage %d) - prot %d/%d%s (kr %d)",
+              (unsigned long)a1, a0, (int)sm, prot, maxp, ro ? ", READ-ONLY: copied in, never synced out" : "", kr); } }
     { static int said; if (!said++) nvlog("newBufferWithBytesNoCopy: COPIED %lu bytes at %p (import alignment %zu) \u2014 resynced at every submission",
                                           (unsigned long)a1, a0, nvmtl_vk_host_import_align()); }
     return b;

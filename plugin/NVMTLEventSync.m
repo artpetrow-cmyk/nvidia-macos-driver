@@ -42,8 +42,11 @@ static int nvmtl_gsub_finish(NVMTLSubmissionPart *part) {
 // Queue keys and command-buffer references are weak. An abandoned recording is
 // never registered; completion removes committed entries without retaining VRAM.
 static NSMapTable *nvmtl_surface_writers;
+// ws1: built once per texture - WindowServer asked for it on every IOSurface texture bind (a string format each time);
+// callers hold the [NVMTLCommandBuffer class] lock, so the lazy store is not raced
 static NSString *nvmtl_surface_writer_key(NVMTLTexture *t) {
-    return [NSString stringWithFormat:@"%u:%lu", (unsigned)IOSurfaceGetID(t->_surf), (unsigned long)t->_plane];
+    if (!t->_writerKey) t->_writerKey = [NSString stringWithFormat:@"%u:%lu", (unsigned)IOSurfaceGetID(t->_surf), (unsigned long)t->_plane];
+    return t->_writerKey;
 }
 static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!cb || !t || !t->_surf) return NO;
@@ -60,7 +63,7 @@ static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t)
         return NO;
     }
 }
-static void nvtrace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+// nvtrace is NVMTLObjects.m's macro (included before this file): no prototype here
 static void nvmtl_surface_register_writes(NVMTLCommandBuffer *cb) {
     // The same lock as pending_write and finish_writes, taken here too: the map is shared with the completion thread, and
     // its one caller holding this (recursive) lock today must not be what keeps WindowServer's heap intact.
@@ -319,7 +322,13 @@ static int nvmtl_skip_empty_on(void) {
     memset(&_c, 0, sizeof(_c));
     part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
     // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
-    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && e[0] == '1'; }
+    // ss1: on by default in every process but WindowServer (its frames already wait in commitAndWaitUntilSubmitted):
+    // iconservicesagent handed iconservicesd renders before the GPU had drawn them, and the cached icons were bare glass
+    // plates. NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0 turns it off, =2 applies it to WindowServer too.
+    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES");
+        const int ws = getprogname() && !strcmp(getprogname(), "WindowServer");
+        after = (e && e[0] == '0') ? 0 : (e && e[0] == '2') ? 1 : !ws;
+        nvlog("ss1: scheduled after IOSurface writes %s (NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=%s)", after ? "ON" : "off", e ? e : "unset"); }
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
     for (NVMTLTexture *s in part->surfaces) if (after && s != drawable) _scheduleAfterPublish = YES;
     part->scratch = [_scratch copy]; part->signalEvent = event; part->value = value;
@@ -417,6 +426,63 @@ static int nvmtl_skip_empty_on(void) {
         _gpuTiming.host_after_ns = commands->timing.host_after_ns;
     }
 }
+// su1: IOSurface use counts for the GPU. Apple's drivers count an IOSurface as in use while a submitted command buffer
+// references it, and clients reuse a buffer only when IOSurfaceIsInUse says no (CA backing stores and their tiles,
+// CAMetalLayer drawables, CVPixelBufferPool). Found with the (since dropped) flip-after-fence experiment: apps cleared and
+// redrew tiles the GPU was still compositing (black squares on the panel, 12.10.2026). Held from commit until the buffer
+// finished; one count per surface however many buffers use it. NVMTL_SURFACE_USE: unset/1 = WindowServer, 2 = every
+// process, 0 = off.
+static NSMapTable *gSuCount; static os_unfair_lock gSuLock = OS_UNFAIR_LOCK_INIT;
+static _Atomic unsigned long long gSuHeld, gSuBuffers;
+static int nvmtl_su_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_SURFACE_USE"); const int ws = getprogname() && !strcmp(getprogname(), "WindowServer");
+        on = (e && e[0] == '0') ? 0 : (e && e[0] == '2') ? 1 : ws;
+        if (ws || (e && *e)) nvlog("su1: IOSurface use counts for the GPU %s (NVMTL_SURFACE_USE=%s)", on ? "ON - a surface stays in use until the buffers reading it finished" : "off", e ? e : "unset");
+    }
+    return on;
+}
+static void nvmtl_su_acquire(NVMTLCommandBuffer *cb) {
+    if (!nvmtl_su_on()) return;
+    NSMutableSet *seen = nil;
+    for (NVMTLSubmissionPart *p in cb->_parts) {
+        if (![p isKindOfClass:[NVMTLSubmissionPart class]]) continue;
+        for (id r in p->resources) {
+            if (![r isKindOfClass:[NVMTLTexture class]]) continue;
+            NVMTLTexture *t = r; NVMTLTexture *root = t->_parent ? t->_parent : t;
+            if (!root->_surf) continue;
+            id s = (__bridge id)root->_surf;
+            if (!seen) seen = [NSMutableSet new];
+            [seen addObject:s];
+        }
+    }
+    if (!seen.count) return;
+    cb->_suHeld = [NSMutableArray arrayWithCapacity:seen.count];
+    os_unfair_lock_lock(&gSuLock);
+    if (!gSuCount) gSuCount = [NSMapTable strongToStrongObjectsMapTable];
+    for (id s in seen) {
+        const unsigned long n = [[gSuCount objectForKey:s] unsignedLongValue];
+        if (!n) { IOSurfaceIncrementUseCount((__bridge IOSurfaceRef)s); atomic_fetch_add(&gSuHeld, 1); }
+        [gSuCount setObject:@(n + 1) forKey:s];
+        [cb->_suHeld addObject:s];
+    }
+    os_unfair_lock_unlock(&gSuLock);
+    const unsigned long long k = atomic_fetch_add(&gSuBuffers, 1) + 1;
+    if (k <= 2 || !(k & (k - 1))) nvlog("su1: %llu command buffers held their IOSurfaces in use until finished (%llu surfaces counted so far)",
+                                        k, (unsigned long long)atomic_load(&gSuHeld));
+}
+static void nvmtl_su_release(NVMTLCommandBuffer *cb) {
+    NSMutableArray *held = cb->_suHeld; cb->_suHeld = nil;
+    if (!held.count) return;
+    os_unfair_lock_lock(&gSuLock);
+    for (id s in held) {
+        const unsigned long n = [[gSuCount objectForKey:s] unsignedLongValue];
+        if (n <= 1) { [gSuCount removeObjectForKey:s]; IOSurfaceDecrementUseCount((__bridge IOSurfaceRef)s); }
+        else [gSuCount setObject:@(n - 1) forKey:s];
+    }
+    os_unfair_lock_unlock(&gSuLock);
+}
 - (void)nvmtlFinishExecution:(NSError *)error {
     if (_scheduleAfterPublish) { _scheduleAfterPublish = NO; [self nvmtlMarkScheduled]; }
     for (NSUInteger i = _nextPart; i < _parts.count; i++) {
@@ -456,6 +522,7 @@ static int nvmtl_skip_empty_on(void) {
     [_surfOverwrites removeAllObjects]; _surfOverwrites = nil;
     if (!error) nvmtl_res2_cb_done(self);
     [self nvmtlReleaseCapacity];
+    nvmtl_su_release(self);
 }
 - (void)nvmtlFinishCallbacks {
     [_completionCondition lock];
@@ -565,8 +632,15 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
         {
             static int hold = -1;
             if (hold < 0) { const char *e = getenv("NVMTL_GSUB_HOSTPTR_LIFT"); hold = (e && *e && *e != '0') ? 0 : 1; }
-            if (hold && part->hasHostCopies) return NO;
+            if (hold) {
+                if (part->hasHostCopies) return NO;
+                for (id resource in part->resources)   // tsync1: a texture refreshed from its buffer at every submission
+                    if ([resource isKindOfClass:[NVMTLTexture class]] && nvmtl_texture_needs_sync((NVMTLTexture *)resource)) return NO;
+            }
         }
+        // tsync1: an ahead part refreshes its buffer-copied textures too (the copied buffers are synced just below)
+        for (id resource in part->resources)
+            if ([resource isKindOfClass:[NVMTLTexture class]]) nvmtl_texture_sync_in(resource);
         nvmtl_inflight *f = nvmtl_vk_inflight_new();
         if (!f) return NO;
         for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
@@ -640,6 +714,8 @@ static void nvmtl_gsub_ahead_pass1(void) {
         else {
             nvmtl_prepare_submission_copies(part);
             for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
+            for (id resource in part->resources)   // tsync1: textures copied from a buffer are refreshed as well
+                if ([resource isKindOfClass:[NVMTLTexture class]]) nvmtl_texture_sync_in(resource);
             result = nvmtl_vk_submit_wait(&part->commands);
         }
         if (result == -2) {
@@ -700,6 +776,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
     @synchronized ([NVMTLCommandBuffer class]) {
         _commitMarking = NO;
         nvmtl_surface_register_writes(self);
+        nvmtl_su_acquire(self);
         if (!nvmtl_pending_buffers) nvmtl_pending_buffers = [NSMutableArray new];
         [nvmtl_pending_buffers addObject:self];
         nvmtl_pump_buffers();

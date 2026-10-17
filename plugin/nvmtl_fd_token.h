@@ -22,7 +22,11 @@ static int nvmtl_icd_open(const char *path, int flags, ...)
         (flags & ~O_CLOEXEC) != O_RDONLY ||
         (errno != EACCES && errno != EPERM)) return fd;
     int ends[2];
-    if (pipe(ends)) return -1;
+    if (pipe(ends)) {
+        /* WebKit's GPU process refuses /dev/null and pipe() alike; it may read /dev/random (sbx1). The descriptor is
+         * still only a handle number: nothing reads from it. */
+        return open("/dev/random", O_RDONLY | (flags & O_CLOEXEC));
+    }
     close(ends[1]);
     if ((flags & O_CLOEXEC) && fcntl(ends[0], F_SETFD, FD_CLOEXEC) < 0) {
         int error = errno; close(ends[0]); errno = error; return -1;

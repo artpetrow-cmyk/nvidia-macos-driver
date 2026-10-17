@@ -104,6 +104,15 @@ void nvlog(const char *fmt, ...) {
     else     snprintf(t, sizeof t, "%s", b);
 #if NVMTL_RELEASE
     if (nvmtl_log_failure(t)) syslog(LOG_ERR, "NullMoth: %s", t);
+    // dlog1: NVMTL_LOG_FILE=<path> (from nvrm610.conf or a per-process nvmtl-knobs.<program> file) appends every line,
+    // unfiltered, to that file - for processes whose syslog never arrives (Chromium's GPU process) or for full detail
+    { static _Atomic int fd = -1;
+      if (fd < 0) { const char *p = getenv("NVMTL_LOG_FILE");
+          if (p && *p) { int f = open(p, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600); int none = -1;
+              if (f >= 0 && !atomic_compare_exchange_strong(&fd, &none, f)) close(f); } }
+      if (fd >= 0) { char line[720]; struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); struct tm tm; localtime_r(&ts.tv_sec, &tm);
+          int k = snprintf(line, sizeof line, "%02d:%02d:%02d.%03ld %d %s\n", tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000, getpid(), t);
+          if (k > 0) (void)!write(fd, line, (size_t)(k < (int)sizeof line ? k : (int)sizeof line - 1)); } }
 #else
     syslog(LOG_NOTICE, "NVMTL: %s", t);
     FILE *f = fopen(nvmtl_log_path(), "a"); if (f) { fprintf(f, "pid %d NVMTL: %s\n", getpid(), t); fclose(f); }
@@ -715,6 +724,9 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
     if (nvmtl_vk_init()) return nil;
+    if (d.mipmapLevelCount > 1) { static _Atomic unsigned n; const unsigned k = atomic_fetch_add(&n, 1) + 1;
+        if (k <= 6 || !(k & (k - 1))) nvlog("tex1 mipmapped texture #%u: %lux%lu fmt %lu, %lu levels, usage 0x%lx", k, (unsigned long)d.width, (unsigned long)d.height,
+                                           (unsigned long)d.pixelFormat, (unsigned long)d.mipmapLevelCount, (unsigned long)d.usage); }
     if (d.textureType == MTLTextureTypeTextureBuffer) {
         extern int nvmtl_pixfmt_public(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8);
         uint32_t vkf = 0, bpp = 0; int a8 = 0;
@@ -747,14 +759,24 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
         if (wantStex) { static _Atomic unsigned long msw; const unsigned long k = atomic_fetch_add(&msw, 1) + 1;
             if (!(k & (k - 1))) nvlog("newTextureWithDescriptor: %lu multisample texture(s) asked for ShaderWrite - created like Apple (M1/D300 create them); no storage view", k); }
         if (nvmtl_vk_image_create_ms_full((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)d.sampleCount, (uint32_t)d.textureType, (uint32_t)d.arrayLength, &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED (multisample)"); return nil; }
-    } else
-    if (nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth), &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+    } else {
+    const uint32_t layersD = nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth);
+    const BOOL dp = d.storageMode == MTLStorageModePrivate && d.textureType == MTLTextureType2D && d.sampleCount <= 1;
+    const uint32_t dkey[12] = { 7, (uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)a8, (uint32_t)d.mipmapLevelCount, (uint32_t)wantStex,
+                                (uint32_t)d.textureType, layersD, (uint32_t)d.usage, (uint32_t)d.storageMode };
+    if (dp) { t->_dparkable = YES; memcpy(t->_pkey, dkey, sizeof dkey); }
+    if (!(dp && nvmtl_dpark_take(dkey, &t->_i) == 0) &&
+        nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, layersD, &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+    }
     nvmtl_alloc_ok();
     t->_q = nvmtl_device_queue();
     t->_stex = t->_i.storage != 0;
     t->_usage = d.usage;
-    if (wantStex && !t->_stex) { static unsigned long lost; lost++;
-        if (!(lost & (lost - 1))) nvlog("newTextureWithDescriptor: pixel format %lu asked for ShaderWrite and NVK cannot make it a storage image — shader writes to it will be LOST (%lu texture(s) so far in this process)", (unsigned long)d.pixelFormat, lost); }
+    if (wantStex && !t->_stex && t->_i.samples <= 1) { static unsigned long lost; lost++;   // sm1: multisample is reported above
+        if (!(lost & (lost - 1))) nvlog("newTextureWithDescriptor: pixel format %lu asked for ShaderWrite and NVK cannot make it a storage image — shader writes to it will be LOST (%lu texture(s) so far in this process) | rc1: type %lu %lux%lux%lu mips %lu layers %u usage 0x%lx storage mode %lu vkf %u a8 %d storage-capable %d image storage %u usage 0x%x parked %d",
+                                        (unsigned long)d.pixelFormat, lost, (unsigned long)d.textureType, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.depth,
+                                        (unsigned long)d.mipmapLevelCount, t->_i.layers, (unsigned long)d.usage, (unsigned long)d.storageMode, vkf, a8,
+                                        nvmtl_vk_format_is_storage(vkf), t->_i.storage, t->_i.usage, (int)t->_dparkable); }
     nvmtl_texture_desc_swizzle(t, d);
     nvlog("newTextureWithDescriptor: %lux%lu%s -> %p", (unsigned long)d.width, (unsigned long)d.height, t->_stex ? " +storage" : "", (__bridge void *)t); return t; }
 
@@ -795,19 +817,266 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
     CFDataRef d = CFDataCreate(NULL, (const UInt8 *)&t, sizeof t); CFStringRef k = nvmtl_vram_tag_key(plane);
     IOSurfaceSetValue(surf, k, d); CFRelease(k); CFRelease(d);
 }
-static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
-                                      uint32_t vkf, uint32_t bpp, int a8, int stex)
+// sin2: a plane of a multi-plane IOSurface (video frames: 'x420', '420v', '444f' - the software HEVC decoder writes them
+// with the CPU) had a private image and its pixels were copied in by the CPU at every new frame: 16.6 MB per 4K plane,
+// up to ~100 MB/s in WindowServer while the Aerial wallpaper played. Such a plane, when only sampled, now gets a linear
+// image over its own system-memory pages imported for the GPU - no copy at all, and the decoder's next frame in the
+// same surface is simply there. Falls back to the old path when the import or the alias is refused.
+// NVMTL_SURFACE_HOST_ALIAS=0 turns it off.
+static int nvmtl_surface_host_alias(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h, uint32_t vkf, uint32_t bpp, int a8)
 {
+    static int on = -1; if (on < 0) { const char *e = getenv("NVMTL_SURFACE_HOST_ALIAS"); on = !(e && *e == '0'); }
+    if (!on || !surf || IOSurfaceGetPlaneCount(surf) < 2 || plane >= IOSurfaceGetPlaneCount(surf)) return -1;
+    if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return -1;
+    uint8_t *pb = IOSurfaceGetBaseAddressOfPlane(surf, (uint32_t)plane);
+    const size_t prow = IOSurfaceGetBytesPerRowOfPlane(surf, (uint32_t)plane), ph = IOSurfaceGetHeightOfPlane(surf, (uint32_t)plane);
+    IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+    extern size_t nvmtl_vk_host_import_align(void);
+    const size_t al = nvmtl_vk_host_import_align();
+    static _Atomic unsigned made, refused;
+    if (!pb || !al || (al & (al - 1)) || prow < (size_t)w * bpp || ph < h) return -1;
+    const uintptr_t start = (uintptr_t)pb & ~(uintptr_t)(al - 1); const size_t off = (uintptr_t)pb - start;
+    const size_t len = (off + prow * h + al - 1) & ~(al - 1);
+    nvk_buffer hb;
+    if (nvmtl_vk_buffer_import_host((void *)start, len, &hb) == 0) {
+        if (nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, 0, 0, &hb, off, prow, &t->_i) == 0) {
+            t->_hostAlias = hb; t->_hostAliasOn = YES;
+            const unsigned k = atomic_fetch_add(&made, 1) + 1; const OSType cc = IOSurfaceGetPixelFormat(surf);
+            if (k <= 4 || !(k & (k - 1))) nvlog("sin2 surface %u '%c%c%c%c' plane %lu %ux%u row %zu: sampled straight from system memory, no CPU copies (#%u)",
+                                               (unsigned)IOSurfaceGetID(surf), (char)(cc >> 24), (char)(cc >> 16), (char)(cc >> 8), (char)cc, (unsigned long)plane, w, h, prow, k);
+            return 0;
+        }
+        nvmtl_vk_buffer_destroy(&hb);
+    }
+    if (atomic_fetch_add(&refused, 1) < 4) nvlog("sin2 surface %u plane %lu %ux%u: system-memory import or alias refused - copied as before", (unsigned)IOSurfaceGetID(surf), (unsigned long)plane, w, h);
+    return -1;
+}
+// sin3: single-plane IOSurfaces the CPU keeps redrawing - other apps' window layers drawn with CoreGraphics, the menu
+// bar, desktop widgets - lived in the surface's family VRAM, and every redraw made the sampling process copy the WHOLE
+// surface in through the CPU (sin1) before its next use: in WindowServer 3.2 GB in the first 4 minutes after a boot,
+// mostly 2560x1440 and 1920x1080 BGRA at 14.7 and 8.3 MB a copy, ~10% of its main thread in a spindump, with a page
+// fault on every 4 KB of a freshly written surface. A surface copied in 3 times within 2 s is "hot": new textures over it
+// sample its system-memory pages directly, as sin2 does for video planes - the next redraw is simply there. The import
+// of its pages is kept per surface, so CoreAnimation re-wrapping the surface at every update costs an image alias, not a
+// VRAM import. A hot surface unchanged for 5 s goes back to VRAM at its next wrap (VRAM is faster for what stays still);
+// an import no texture uses is dropped after 5 s; at most 128 imports / 384 MB pinned. su1 keeps clients from redrawing a
+// surface WindowServer's GPU still reads. Every 30 s the heaviest copied surfaces go to the log (the census).
+// sin3b (fbf42): apps keep several such surfaces in rotation (Electron: 4-6 window buffers of one size, each redrawn
+// less than 3 times in 2 s), so hotness is also per pool - same width, height and pixel format: 3 copies within 2 s
+// across its members make the pool hot, and while it is hot every member is direct from its first wrap. A direct read is right only while system memory holds the newest pixels: when
+// the surface's VRAM tag is current for its seed (a GPU wrote it, or it was just copied in), the VRAM path is taken.
+// NVMTL_SURFACE_HOST_HOT=0 turns sin3 off; the census stays.
+#define SIN3_N       256
+#define SIN3_IMPORTS 128   // fbf43: was 32 - menu-bar text strips and capture frames (7-12 MB in all) took every slot
+#define SIN3_PINMAX  (384ull << 20)
+#define SIN3_SEC     1000000000ull
+typedef struct nvmtl_sin3 {
+    uint32_t id, w, h, fmt, seed, copyN; char name[40];
+    uint64_t copyT[3], seedT, lastSeen, idleSince, winCopies, winBytes, copies, bytes, made, reused;
+    IOSurfaceRef s; nvk_buffer hb; size_t off, len, row; int refs, imported, noImport;
+} nvmtl_sin3;
+static nvmtl_sin3 g_sin3[SIN3_N];
+static pthread_mutex_t g_sin3_lk = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_sin3_pinned, g_sin3_censusT, g_sin3_wc, g_sin3_wb, g_sin3_wmade, g_sin3_wreuse, g_sin3_wimp, g_sin3_wref, g_sin3_wcold;
+static uint64_t g_sin3_wpool, g_sin3_wvramnew;   // pool members taken direct at first sight; hot wraps left to VRAM (tag current)
+typedef struct { uint32_t w, h, fmt, copyN; uint64_t hotT, copyT[3]; } nvmtl_sin3_pool;
+#define SIN3_POOLS 16
+static nvmtl_sin3_pool g_sin3_pool[SIN3_POOLS];
+static nvmtl_sin3_pool *nvmtl_sin3_pool_get(uint32_t w, uint32_t h, uint32_t fmt, int add) {
+    nvmtl_sin3_pool *old = &g_sin3_pool[0];
+    for (int i = 0; i < SIN3_POOLS; i++) {
+        nvmtl_sin3_pool *p = &g_sin3_pool[i];
+        if (p->w == w && p->h == h && p->fmt == fmt) return p;
+        if (p->hotT < old->hotT) old = p;
+    }
+    if (!add) return NULL;
+    memset(old, 0, sizeof *old); old->w = w; old->h = h; old->fmt = fmt;
+    return old;
+}
+static uint32_t g_sin3_imports;
+static _Atomic unsigned long long g_sin3_wvram;   // family-VRAM wraps of single-plane surfaces in this census window
+static int nvmtl_sin3_on(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("NVMTL_SURFACE_HOST_HOT"); on = !(e && *e == '0'); } return on; }
+static nvmtl_sin3 *nvmtl_sin3_find(uint32_t id, int add, uint64_t now) {
+    nvmtl_sin3 *free_e = NULL, *old = NULL;
+    for (int i = 0; i < SIN3_N; i++) {
+        nvmtl_sin3 *e = &g_sin3[i];
+        if (e->id == id) return e;
+        if (!e->id) { if (!free_e) free_e = e; continue; }
+        if (!e->imported && (!old || e->lastSeen < old->lastSeen)) old = e;
+    }
+    if (!add) return NULL;
+    nvmtl_sin3 *e = free_e ? free_e : old;
+    if (!e) return NULL;
+    memset(e, 0, sizeof *e); e->id = id; e->lastSeen = now;
+    return e;
+}
+static void nvmtl_sin3_drop(nvmtl_sin3 *e) {   // under the lock, refs == 0
+    if (!e->imported) return;
+    nvmtl_vk_buffer_destroy(&e->hb); memset(&e->hb, 0, sizeof e->hb);
+    if (e->s) CFRelease(e->s);
+    e->s = NULL; e->imported = 0; g_sin3_imports--; g_sin3_pinned -= e->len; e->len = 0;
+}
+static void nvmtl_sin3_sweep(uint64_t now, int need) {   // drop idle imports; `need` frees the oldest idle one now
+    nvmtl_sin3 *oldest = NULL;
+    for (int i = 0; i < SIN3_N; i++) {
+        nvmtl_sin3 *e = &g_sin3[i];
+        if (!e->imported || e->refs) continue;
+        if (now - e->idleSince > 5 * SIN3_SEC) nvmtl_sin3_drop(e);
+        else if (!oldest || e->idleSince < oldest->idleSince) oldest = e;
+    }
+    if (need && oldest) nvmtl_sin3_drop(oldest);
+}
+static int nvmtl_sin3_hot(const nvmtl_sin3 *e, uint64_t now) {
+    if (e->imported && now - e->seedT < 5 * SIN3_SEC) return 1;   // live and still changing
+    if (e->copyN < 3) return 0;
+    uint64_t lo = e->copyT[0]; for (int i = 1; i < 3; i++) if (e->copyT[i] < lo) lo = e->copyT[i];
+    return now - lo <= 2 * SIN3_SEC;
+}
+// Builds the census line under the lock (returns 1 when one is due); it is logged after the unlock.
+static int nvmtl_sin3_census(uint64_t now, char *out, size_t cap) {
+    if (!g_sin3_censusT) { g_sin3_censusT = now; return 0; }
+    if (now - g_sin3_censusT < 30 * SIN3_SEC) return 0;
+    const double secs = (double)(now - g_sin3_censusT) / 1e9; g_sin3_censusT = now;
+    const unsigned long long vram = atomic_exchange(&g_sin3_wvram, 0);
+    if (!g_sin3_wc && !g_sin3_wmade && !g_sin3_wreuse) { g_sin3_wimp = g_sin3_wref = g_sin3_wcold = 0; return 0; }
+    int n = snprintf(out, cap, "sin3 census %.0f s: %llu copies in (%.1f MB/s) | sin3 %s: %llu imports, %llu aliases made, %llu re-wraps over a kept import, %llu pool members direct at first sight, %llu refused, %llu back to VRAM, %llu left to VRAM (newest there); %u imports live (%llu MB pinned) | %llu family-VRAM wraps | top:",
+                     secs, (unsigned long long)g_sin3_wc, g_sin3_wb / secs / 1048576.0, nvmtl_sin3_on() ? "on" : "OFF",
+                     (unsigned long long)g_sin3_wimp, (unsigned long long)g_sin3_wmade, (unsigned long long)g_sin3_wreuse,
+                     (unsigned long long)g_sin3_wpool, (unsigned long long)g_sin3_wref, (unsigned long long)g_sin3_wcold,
+                     (unsigned long long)g_sin3_wvramnew, g_sin3_imports, (unsigned long long)(g_sin3_pinned >> 20), vram);
+    for (int k = 0; k < 5 && n > 0 && (size_t)n < cap; k++) {   // the five surfaces copied most in this window
+        nvmtl_sin3 *best = NULL;
+        for (int i = 0; i < SIN3_N; i++) { nvmtl_sin3 *e = &g_sin3[i];
+            if (e->id && e->winBytes && (!best || e->winBytes > best->winBytes)) best = e; }
+        if (!best) break;
+        n += snprintf(out + n, cap - n, " #%u %ux%u '%c%c%c%c' \"%s\" %llu copies %.0f MB%s%s;", best->id, best->w, best->h,
+                      (char)(best->fmt >> 24), (char)(best->fmt >> 16), (char)(best->fmt >> 8), (char)best->fmt, best->name,
+                      (unsigned long long)best->winCopies, best->winBytes / 1048576.0, nvmtl_sin3_hot(best, now) ? " hot" : "",
+                      best->imported ? " direct" : "");
+        best->winBytes = 0;   // taken; the rest are cleared below
+    }
+    for (int i = 0; i < SIN3_N; i++) { g_sin3[i].winBytes = 0; g_sin3[i].winCopies = 0; }
+    g_sin3_wc = g_sin3_wb = g_sin3_wmade = g_sin3_wreuse = g_sin3_wimp = g_sin3_wref = g_sin3_wcold = g_sin3_wpool = g_sin3_wvramnew = 0;
+    return 1;
+}
+static void nvmtl_sin3_log(const char *text) { syslog(LOG_ERR, "NullMoth: %s", text); }   // the census bypasses nvlog's repeat cap
+// sin1 reports a whole-surface copy-in here.
+static void nvmtl_sin3_note_copy(IOSurfaceRef s, size_t bytes) {
+    if (!s || IOSurfaceGetPlaneCount(s) > 1) return;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    char line[1400]; int due;
+    pthread_mutex_lock(&g_sin3_lk);
+    nvmtl_sin3 *e = nvmtl_sin3_find(IOSurfaceGetID(s), 1, now);
+    const uint32_t cw = (uint32_t)IOSurfaceGetWidth(s), ch = (uint32_t)IOSurfaceGetHeight(s), cf = IOSurfaceGetPixelFormat(s);
+    if (e && !e->imported && e->w && (e->w != cw || e->h != ch || e->fmt != cf)) {   // the ID now names another surface
+        const uint32_t id = e->id; memset(e, 0, sizeof *e); e->id = id; e->lastSeen = now;
+    }
+    if (e) {
+        if (!e->w) {   // first sight: what it is, once
+            e->w = (uint32_t)IOSurfaceGetWidth(s); e->h = (uint32_t)IOSurfaceGetHeight(s); e->fmt = IOSurfaceGetPixelFormat(s);
+            CFTypeRef nm = IOSurfaceCopyValue(s, CFSTR("IOSurfaceName"));
+            if (nm && CFGetTypeID(nm) == CFStringGetTypeID()) CFStringGetCString((CFStringRef)nm, e->name, sizeof e->name, kCFStringEncodingUTF8);
+            if (nm) CFRelease(nm);
+        }
+        e->copyT[e->copyN++ % 3] = now; e->lastSeen = now;
+        e->copies++; e->bytes += bytes; e->winCopies++; e->winBytes += bytes;
+        if (nvmtl_sin3_on()) {   // sin3b: copies counted per pool too
+            nvmtl_sin3_pool *p = nvmtl_sin3_pool_get(e->w, e->h, e->fmt, 1);
+            p->copyT[p->copyN++ % 3] = now;
+            uint64_t lo = p->copyT[0]; for (int i = 1; i < 3; i++) if (p->copyT[i] < lo) lo = p->copyT[i];
+            if (nvmtl_sin3_hot(e, now) || (p->copyN >= 3 && now - lo <= 2 * SIN3_SEC)) p->hotT = now;
+        }
+    }
+    g_sin3_wc++; g_sin3_wb += bytes;
+    due = nvmtl_sin3_census(now, line, sizeof line);
+    pthread_mutex_unlock(&g_sin3_lk);
+    if (due) nvmtl_sin3_log(line);
+}
+// A new sample-only texture over plane 0 of a single-plane surface: a direct alias when the surface is hot.
+static int nvmtl_sin3_alias(NVMTLTexture *t, IOSurfaceRef s, uint32_t w, uint32_t h, uint32_t vkf, uint32_t bpp, int a8) {
+    if (!s || !nvmtl_sin3_on() || IOSurfaceGetPlaneCount(s) > 1) return -1;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    char line[1400]; int due = 0, rc = -1;
+    pthread_mutex_lock(&g_sin3_lk);
+    const uint32_t sw = (uint32_t)IOSurfaceGetWidth(s), shh = (uint32_t)IOSurfaceGetHeight(s), sf = IOSurfaceGetPixelFormat(s);
+    nvmtl_sin3_pool *pool = nvmtl_sin3_pool_get(sw, shh, sf, 0);
+    const int poolHot = pool && pool->hotT && now - pool->hotT <= 2 * SIN3_SEC;
+    nvmtl_sin3 *e = nvmtl_sin3_find(IOSurfaceGetID(s), 0, now);
+    if (!e && poolHot && (e = nvmtl_sin3_find(IOSurfaceGetID(s), 1, now))) { e->w = sw; e->h = shh; e->fmt = sf; g_sin3_wpool++; }
+    if (e) {
+        e->lastSeen = now;
+        const uint32_t seed = IOSurfaceGetSeed(s);
+        if (seed != e->seed) { e->seed = seed; e->seedT = now; }
+        const int hot = nvmtl_sin3_hot(e, now) || poolHot;
+        if (!hot) { if (e->imported) g_sin3_wcold++; }
+        else if (nvmtl_vram_tag_current(s, 0, seed)) g_sin3_wvramnew++;   // the newest pixels are in VRAM: read them there
+        else if (!e->noImport) {
+            if (!e->imported) {
+                IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+                uint8_t *base = IOSurfaceGetBaseAddress(s); const size_t row = IOSurfaceGetBytesPerRow(s), sh = IOSurfaceGetHeight(s);
+                IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+                extern size_t nvmtl_vk_host_import_align(void);
+                const size_t al = nvmtl_vk_host_import_align() ? nvmtl_vk_host_import_align() : 4096;
+                const uintptr_t start = (uintptr_t)base & ~(uintptr_t)(al - 1);
+                const size_t off = (uintptr_t)base - start, len = (off + row * sh + al - 1) & ~(al - 1);
+                if (g_sin3_imports >= SIN3_IMPORTS || g_sin3_pinned + len > SIN3_PINMAX) nvmtl_sin3_sweep(now, 1);
+                if (base && row && sh >= h && g_sin3_imports < SIN3_IMPORTS && g_sin3_pinned + len <= SIN3_PINMAX
+                    && nvmtl_vk_buffer_import_host((void *)start, len, &e->hb) == 0) {
+                    e->s = (IOSurfaceRef)CFRetain(s); e->off = off; e->len = len; e->row = row; e->imported = 1; e->idleSince = now;
+                    g_sin3_imports++; g_sin3_pinned += len; g_sin3_wimp++;
+                } else { e->noImport = base && row && g_sin3_imports < SIN3_IMPORTS; g_sin3_wref++; }
+            }
+            if (e->imported && nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, 0, 0, &e->hb, e->off, e->row, &t->_i) == 0) {
+                if (e->refs++) { e->reused++; g_sin3_wreuse++; } else { e->made++; g_sin3_wmade++; }
+                t->_hostAlias = e->hb; t->_hostAliasOn = YES; t->_sin3 = e; rc = 0;
+                if (nvmtl_sin3_hot(e, now)) nvmtl_sin3_pool_get(sw, shh, sf, 1)->hotT = now;   // sin3b: the pool stays hot while members change
+            } else if (e->imported) g_sin3_wref++;
+        }
+    }
+    nvmtl_sin3_sweep(now, 0);
+    due = nvmtl_sin3_census(now, line, sizeof line);
+    pthread_mutex_unlock(&g_sin3_lk);
+    if (due) nvmtl_sin3_log(line);
+    return rc;
+}
+// The texture is gone (after the GPU finished with it): the import stays for the next wrap, dropped when idle.
+static void nvmtl_sin3_release(void *p) {
+    nvmtl_sin3 *e = p; if (!e) return;
+    pthread_mutex_lock(&g_sin3_lk);
+    if (e->refs > 0 && !--e->refs) e->idleSince = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    pthread_mutex_unlock(&g_sin3_lk);
+}
+static int nvmtl_surface_untouched(IOSurfaceRef s, NSUInteger plane);   // NVMTLObjects.m (fz1)
+static int nvmtl_vram_fresh_claim_on(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("NVMTL_VRAM_FRESH_CLAIM"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
+                                      uint32_t vkf, uint32_t bpp, int a8, int stex, MTLTextureUsage usage)
+{
+    if (!(usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) && !stex && nvmtl_surface_host_alias(t, surf, plane, w, h, vkf, bpp, a8) == 0) return 0;
+    if (!(usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) && !stex && plane == 0 && nvmtl_sin3_alias(t, surf, w, h, vkf, bpp, a8) == 0) return 0;
     if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_share_on()) {
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
             nvk_buffer vb;
             if (!nvmtl_vk_surface_vram(IOSurfaceGetID(surf), 0, row * h, &vb)) {
                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
-                    t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
+                    t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++; atomic_fetch_add(&g_sin3_wvram, 1);
+                    t->_i.sid = IOSurfaceGetID(surf);   // lsh1: a fetch-drawn surface stays known across its wraps
                     uint32_t seed = IOSurfaceGetSeed(surf);
                     int current = nvmtl_vram_tag_current(surf, 0, seed);
                     if (current) { t->_surfSeed = seed; t->_surfSynced = YES; }
+                    // vt3: a never-written surface is cleared and claimed here, when it is wrapped - the process that made
+                    // it wraps it before any other process knows its ID. vt1 claimed it only when the first write was
+                    // encoded; a compositor that wrapped it before that saw no claim, and its zero clear or copy of the
+                    // untouched system memory could land on the GPU after this process had drawn (a web app's buttons, 15.10).
+                    else if (!seed && nvmtl_vram_fresh_claim_on() && nvmtl_surface_untouched(surf, 0) && nvmtl_vk_image_zero_now(&t->_i) == 0) {
+                        nvmtl_vram_tag_set(surf, 0, 0); t->_surfSeed = 0; t->_surfSynced = YES; t->_surfGen = nvmtl_vram_gen(surf, 0);
+                        static _Atomic unsigned long nf; const unsigned long k = atomic_fetch_add(&nf, 1) + 1;
+                        if (k <= 2 || !(k & (k - 1))) nvlog("vt3 fresh surfaces claimed at wrap: %lu (cleared on the GPU, tagged before any write)", k);
+                    }
                     static unsigned n; if (n++ < 8 || n % 2000 == 0)
                         nvlog("item 7: surface %u %ux%u pitch %zu -> the family's VRAM%s (vram %llu, private %llu)", (unsigned)IOSurfaceGetID(surf),
                               w, h, row, current ? ", already current (no upload)" : "", g_surf_vram, g_surf_private);
@@ -843,6 +1112,11 @@ static char nvmtl_surface_cache_key;
 }
 - (id<MTLTexture>)nvmtlNewSurfaceTexture:(MTLTextureDescriptor *)d surface:(IOSurfaceRef)surf plane:(NSUInteger)plane cache:(NSMapTable *)cache {
     if (nvmtl_vk_init()) return nil;
+    { static _Atomic unsigned n; const unsigned k = atomic_fetch_add(&n, 1) + 1;
+      if (k <= 10 || !(k & (k - 1))) { const OSType cc = surf ? IOSurfaceGetPixelFormat(surf) : 0;
+          nvlog("tex1 iosurface texture #%u: %lux%lu fmt %lu, %lu levels, usage 0x%lx, surface %u '%c%c%c%c' %zux%zu plane %lu", k, (unsigned long)d.width, (unsigned long)d.height,
+                (unsigned long)d.pixelFormat, (unsigned long)d.mipmapLevelCount, (unsigned long)d.usage, surf ? (unsigned)IOSurfaceGetID(surf) : 0u,
+                (char)(cc >> 24), (char)(cc >> 16), (char)(cc >> 8), (char)cc, surf ? IOSurfaceGetWidth(surf) : 0, surf ? IOSurfaceGetHeight(surf) : 0, (unsigned long)plane); } }
     size_t w = d.width, h = d.height;
     if (!w || !h || w > UINT32_MAX || h > UINT32_MAX) return nil;
     if (surf && plane >= MAX((size_t)1, IOSurfaceGetPlaneCount(surf))) return nil;
@@ -867,7 +1141,7 @@ static char nvmtl_surface_cache_key;
             return alias;
         }
     }
-    if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex)) {
+    if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex, d.usage)) {
         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
     t->_q = nvmtl_device_queue();
     t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; }
@@ -1419,6 +1693,14 @@ void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
         if (!n || n > 32)
             return nvmtl_fail(err, [NSString stringWithFormat:@"tess pipeline: REFUSED - %@ has no fixed control-point count in 1..32 (%u)", vf->_fname, n]);
         if (!tr) nvlog("tess pipeline: %s has no reflection - its instance_id Location is inferred from the interface", vf->_fname.UTF8String ?: "?");
+        { // tess1: what the app hands over for a post-tessellation function - the descriptor and the reflected interface
+          NSUInteger nl = 0; for (NSUInteger b = 0; vd && b < 31; b++) if (vd.layouts[b].stride) nl++;
+          nvlog("tess1 %s: %u control point(s), vertexDescriptor %s, %u attribute(s)%s, %lu layout(s) with a stride; reflection %s",
+                vf->_fname.UTF8String ?: "?", tcps, vd ? "set" : "nil", vin.nattr, vdesc.length ? vdesc.UTF8String : "", (unsigned long)nl,
+                tr ? [[[tr description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "] UTF8String] : "-");
+          for (NSUInteger b = 0; vd && b < 31; b++) { MTLVertexBufferLayoutDescriptor *ld = vd.layouts[b];
+              if (ld.stride) nvlog("tess1   layout %lu: stride %lu step %lu rate %lu", (unsigned long)b, (unsigned long)ld.stride,
+                                   (unsigned long)ld.stepFunction, (unsigned long)ld.stepRate); } }
         float mf = (float)d.maxTessellationFactor; if (mf > 64.0f) mf = 64.0f; if (mf < 1.0f) mf = 1.0f;
         nvk_tess_desc td = { tpt, n, (uint32_t)d.tessellationPartitionMode, (uint32_t)d.tessellationOutputWindingOrder,
             (uint32_t)d.tessellationFactorStepFunction, d.isTessellationFactorScaleEnabled ? 1u : 0u, (uint32_t)d.tessellationControlPointIndexType,
@@ -1536,6 +1818,7 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
           (unsigned long)d.maxTotalThreadsPerThreadgroup,
           (int)d.threadGroupSizeIsMultipleOfThreadExecutionWidth);
 }
+static __thread int g_stagein_ok;   // kstage2: set while the descriptor route builds a stage-in kernel it can feed
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)o
                                                           reflection:(MTLAutoreleasedComputePipelineReflection *)r error:(NSError **)err {
     nvmtl_log_compute_descriptor(d);
@@ -1547,7 +1830,43 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     if (!kfn) { if (err) *err = le; if (r) *r = nil; return nil; }
     NSString *tgWhy = nvmtl_tg_mismatch(kfn, d.maxTotalThreadsPerThreadgroup, "compute pipeline");
     if (tgWhy) { if (r) *r = nil; return nvmtl_fail(err, tgWhy); }
+    // kstage2: a kernel's [[stage_in]] members, matched with the descriptor's stage-input attributes and layouts
+    NSData *siData = nil;
+    if ([(id)kfn isKindOfClass:[NVMTLFunction class]]) {
+        nvk_stagein si; memset(&si, 0, sizeof si); NSString *why = nil; MTLStageInputOutputDescriptor *sd = d.stageInputDescriptor;
+        for (NSDictionary *b in nvmtl_function_reflection((NVMTLFunction *)kfn)[@"bindings"]) {
+            if (![b isKindOfClass:[NSDictionary class]] || ![b[@"kind"] isEqual:@"KernelStageInput"]) continue;
+            if (si.n == NVMTL_STAGEIN_MAX) { why = @"more than 16 stage-in members"; break; }
+            const uint32_t loc = [b[@"stage_input_location"] unsignedIntValue];
+            NSString *tn = [b[@"type_name"] isKindOfClass:[NSString class]] ? b[@"type_name"] : @"";
+            MTLAttributeDescriptor *ad = sd ? sd.attributes[loc] : nil;
+            if (!ad || ad.format == MTLAttributeFormatInvalid) { why = [NSString stringWithFormat:@"stage_in member at location %u has no attribute in the "
+                "stage-input descriptor%@", loc, sd ? @"" : @" (none set)"]; break; }
+            MTLBufferLayoutDescriptor *ld = sd.layouts[ad.bufferIndex];
+            nvk_stagein_attr *a = &si.a[si.n++];
+            a->slot = [b[@"metal_index"] unsignedIntValue]; a->loc = loc; a->fmt = (uint32_t)ad.format; a->offset = (uint32_t)ad.offset;
+            a->buffer = (uint32_t)ad.bufferIndex; a->stride = (uint32_t)ld.stride; a->step = (uint32_t)ld.stepFunction; a->rate = (uint32_t)ld.stepRate;
+            NSString *base = tn; a->comps = 1;
+            if (tn.length && isdigit([tn characterAtIndex:tn.length - 1])) { a->comps = (uint32_t)([tn characterAtIndex:tn.length - 1] - '0'); base = [tn substringToIndex:tn.length - 1]; }
+            if ([base isEqualToString:@"float"]) a->kind = 0; else if ([base isEqualToString:@"int"]) a->kind = 1; else if ([base isEqualToString:@"uint"]) a->kind = 2;
+            else { why = [NSString stringWithFormat:@"stage_in member at location %u has type %@ (float/int/uint 1-4 are carried)", loc, tn]; break; }
+        }
+        if (si.n || why) {
+            si.idx_type = sd ? (uint32_t)sd.indexType : 0; si.idx_buffer = sd ? (uint32_t)sd.indexBufferIndex : 0;
+            char w[240] = ""; if (!why && nvmtl_vk_stagein_check(&si, w, sizeof w)) why = @(w);
+            if (why) { nvlog("kstage2 compute pipeline %s REFUSED: %s", kfn.name.UTF8String ?: "?", why.UTF8String); if (r) *r = nil;
+                return nvmtl_fail(err, [NSString stringWithFormat:@"compute pipeline: %@", why]); }
+            siData = [NSData dataWithBytes:&si length:sizeof si];
+            nvlog("kstage2 compute pipeline %s: %u stage-in member(s), index type %u at buffer %u", kfn.name.UTF8String ?: "?", si.n, si.idx_type, si.idx_buffer);
+            for (uint32_t k = 0; k < si.n; k++) nvlog("kstage2   location %u -> slot %u: format %u at buffer %u + %u, stride %u, step %u/%u, %u x %s",
+                si.a[k].loc, si.a[k].slot, si.a[k].fmt, si.a[k].buffer, si.a[k].offset, si.a[k].stride, si.a[k].step, si.a[k].rate,
+                si.a[k].comps, si.a[k].kind == 0 ? "float" : si.a[k].kind == 1 ? "int" : "uint");
+        }
+    }
+    g_stagein_ok = siData != nil;
     id<MTLComputePipelineState> ps = [self newComputePipelineStateWithFunction:kfn error:err];
+    g_stagein_ok = 0;
+    if (siData && [(id)ps isKindOfClass:[NVMTLComputePipelineState class]]) ((NVMTLComputePipelineState *)ps)->_stageIn = siData;
     if ([(id)ps isKindOfClass:[NVMTLComputePipelineState class]]) { ((NVMTLComputePipelineState *)ps)->_icb = d.supportIndirectCommandBuffers;
         ((NVMTLComputePipelineState *)ps)->_askT = d.maxTotalThreadsPerThreadgroup;
         ((NVMTLComputePipelineState *)ps)->_label = [d.label copy]; }
@@ -1638,8 +1957,41 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
           s->_sb[0], s->_sb[1], s->_sb[2], s->_sb[3], s->_sb[4], s->_sb[5]);
     return s; }
 
+// ws1 (smp1): sampler states are immutable, so an unlabelled descriptor asked for again gets the state made the first time.
+// CoreAnimation in WindowServer made new ones all the time (~1 % of its main thread: a VkSampler, and for pixel-coordinate
+// samplers a dictionary and its description logged). At most 512 kept. NVMTL_SAMPLER_CACHE=0 turns it off.
+typedef struct { uint32_t minf, magf, mipf, s, t, r, border, norm, cmp, aniso, argb, pad; float lmin, lmax; } nvmtl_samp_key;
+static NSMutableDictionary *gSampCache; static os_unfair_lock gSampLock = OS_UNFAIR_LOCK_INIT;
+static _Atomic unsigned long long gSampHit, gSampMade;
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)sd {
     if (nvmtl_vk_init()) return nil;
+    static int smp1 = -1; if (smp1 < 0) { const char *e = getenv("NVMTL_SAMPLER_CACHE"); smp1 = !(e && e[0] == '0'); }
+    NSData *skey = nil;
+    if (smp1 && sd && !sd.label) {
+        nvmtl_samp_key k; memset(&k, 0, sizeof k);
+        k.minf = (uint32_t)sd.minFilter; k.magf = (uint32_t)sd.magFilter; k.mipf = (uint32_t)sd.mipFilter;
+        k.s = (uint32_t)sd.sAddressMode; k.t = (uint32_t)sd.tAddressMode; k.r = (uint32_t)sd.rAddressMode; k.border = (uint32_t)sd.borderColor;
+        k.norm = sd.normalizedCoordinates ? 1u : 0u; k.cmp = (uint32_t)sd.compareFunction; k.aniso = (uint32_t)sd.maxAnisotropy;
+        k.argb = sd.supportArgumentBuffers ? 1u : 0u; k.lmin = sd.lodMinClamp; k.lmax = sd.lodMaxClamp;
+        skey = [NSData dataWithBytes:&k length:sizeof k];
+        os_unfair_lock_lock(&gSampLock); NVMTLSamplerState *hit = gSampCache[skey]; os_unfair_lock_unlock(&gSampLock);
+        if (hit) { const unsigned long long n = atomic_fetch_add(&gSampHit, 1) + 1;
+            if (n == 1 || !(n & (n - 1))) nvlog("smp1 sampler cache: %llu asks answered with a kept state, %llu states made", n, (unsigned long long)atomic_load(&gSampMade));
+            return hit; }
+    }
+    NVMTLSamplerState *made = (NVMTLSamplerState *)[self nvmtlMakeSamplerState:sd];
+    if (made && skey) { os_unfair_lock_lock(&gSampLock); if (!gSampCache) gSampCache = [NSMutableDictionary new];
+        if (gSampCache.count < 512 && !gSampCache[skey]) gSampCache[skey] = made; os_unfair_lock_unlock(&gSampLock); atomic_fetch_add(&gSampMade, 1); }
+    return made;
+}
+- (id<MTLSamplerState>)nvmtlMakeSamplerState:(MTLSamplerDescriptor *)sd {
+    { // tex1 census: every distinct filter set a process asks for, the first 12 (Dock icon minification survey)
+      static uint32_t seen[12]; static int nseen; const uint32_t key = (uint32_t)sd.minFilter | (uint32_t)sd.magFilter << 2 | (uint32_t)sd.mipFilter << 4 |
+          (uint32_t)(sd.maxAnisotropy & 31) << 6 | (uint32_t)sd.normalizedCoordinates << 11 | (uint32_t)(sd.lodMaxClamp < 1000.f) << 12 | (uint32_t)(sd.lodMinClamp > 0.f) << 13;
+      int k = 0; for (; k < nseen; k++) if (seen[k] == key) break;
+      if (k == nseen && nseen < 12) { seen[nseen++] = key;
+          nvlog("tex1 sampler: min %lu mag %lu mip %lu aniso %lu lod %.2f..%.2f %s", (unsigned long)sd.minFilter, (unsigned long)sd.magFilter,
+                (unsigned long)sd.mipFilter, (unsigned long)sd.maxAnisotropy, sd.lodMinClamp, sd.lodMaxClamp, sd.normalizedCoordinates ? "normalized" : "pixel"); } }
     NVMTLSamplerState *s = [NVMTLSamplerState new];
     s->_label = [sd.label copy];
     if (!sd.normalizedCoordinates) {
@@ -1663,8 +2015,16 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
         if ((NSUInteger)sd.minFilter > 1 || (NSUInteger)sd.magFilter > 1 || (NSUInteger)sd.mipFilter > 2 ||
             (NSUInteger)sd.sAddressMode > 5 || (NSUInteger)sd.tAddressMode > 5 || (NSUInteger)sd.rAddressMode > 5 ||
             (NSUInteger)sd.compareFunction > 7 || (NSUInteger)sd.borderColor > 2 || sd.maxAnisotropy < 1 || sd.maxAnisotropy > 16) return nil;
+        // aniso1: an anisotropic sampler with mipFilter Nearest (CoreAnimation draws the Dock's 128 px icons at ~54 px this
+        // way) blends neighbouring levels on Apple's GPUs, as D3D's ANISOTROPIC filter does; NVIDIA honours "nearest"
+        // literally and the icons, drawn from the 64 px level alone, turned jagged a few seconds after login (once
+        // com.apple.dock.extra re-rendered them). With maxAnisotropy > 1 the mip filter becomes Linear.
+        // NVMTL_ANISO_TRILINEAR=0 turns it off.
+        static int a1 = -1; if (a1 < 0) { const char *e = getenv("NVMTL_ANISO_TRILINEAR"); a1 = !(e && *e == '0'); }
+        const MTLSamplerMipFilter mf = (a1 && sd.maxAnisotropy > 1 && sd.mipFilter == MTLSamplerMipFilterNearest) ? MTLSamplerMipFilterLinear : sd.mipFilter;
+        if (mf != sd.mipFilter) { static _Atomic int said; if (said++ < 2) nvlog("aniso1 sampler: maxAnisotropy %lu with mipFilter Nearest -> Linear (as Apple GPUs filter it)", (unsigned long)sd.maxAnisotropy); }
         nvmtl_sampler_desc request = { .min_filter = (uint32_t)sd.minFilter, .mag_filter = (uint32_t)sd.magFilter,
-            .mip_filter = (uint32_t)sd.mipFilter, .address_s = (uint32_t)sd.sAddressMode, .address_t = (uint32_t)sd.tAddressMode,
+            .mip_filter = (uint32_t)mf, .address_s = (uint32_t)sd.sAddressMode, .address_t = (uint32_t)sd.tAddressMode,
             .address_r = (uint32_t)sd.rAddressMode, .compare_function = (uint32_t)sd.compareFunction,
             .max_anisotropy = (uint32_t)sd.maxAnisotropy, .border_color = (uint32_t)sd.borderColor,
             .lod_min = sd.lodMinClamp, .lod_max = sd.lodMaxClamp };
@@ -1702,6 +2062,22 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
                                         userInfo:@{ NSLocalizedDescriptionKey: @"function is not a kernel" }];
         return nil;
     }
+    { // kstage1: a kernel's [[stage_in]] members are read from synthetic buffers (reflection kind KernelStageInput) that the
+      // driver is expected to fill from MTLComputePipelineDescriptor.stageInputDescriptor. Nothing fills them yet, so the
+      // kernel would read whatever the app keeps at those buffer indices - Unity's tessellation patch kernel read past its
+      // vertex buffers and the GPU faulted (device lost). Refused until compute stage-in is carried; NVMTL_KERNEL_STAGEIN=1
+      // builds it anyway (the old behaviour).
+      static int allow = -1; if (allow < 0) { const char *e = getenv("NVMTL_KERNEL_STAGEIN"); allow = e && *e == '1'; }
+      const int feeds = allow || g_stagein_ok;   // kstage2: the descriptor route matched every member - it gathers them
+      NSUInteger nsi = 0;
+      for (NSDictionary *b in nvmtl_function_reflection(f)[@"bindings"])
+          if ([b isKindOfClass:[NSDictionary class]] && [b[@"kind"] isEqual:@"KernelStageInput"]) nsi++;
+      if (nsi && !feeds) {
+          nvlog("kstage1 newComputePipelineState: \"%s\" takes %lu [[stage_in]] member(s) (compute stage-input descriptor) - not carried by "
+                "this driver, REFUSED rather than run on unbound vertex data", f->_fname.UTF8String ?: "?", (unsigned long)nsi);
+          return nvmtl_fail(err, [NSString stringWithFormat:@"newComputePipelineState: %@ reads [[stage_in]] through a compute stage-input "
+                                 "descriptor, which this driver does not carry yet", f->_fname]);
+      } }
     NVMTLComputePipelineState *ps = [NVMTLComputePipelineState new];
     ps->_function = f;
     ps->_attrT = nvmtl_air_max_tg(f);
