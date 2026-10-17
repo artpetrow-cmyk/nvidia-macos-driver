@@ -282,6 +282,17 @@ static long nvmtl_sysconf(int name)
     if (host_info(host, HOST_BASIC_INFO, (host_info_t)&hi, &n) != KERN_SUCCESS || !hi.max_mem) return v;
     return (long)(hi.max_mem / (uint64_t)vm_page_size);
 }
+// mc1: Mesa keeps its disk shader cache only for a "normal user" (geteuid() == getuid() && getegid() == getgid()).
+// WebKit's GPU-process sandbox refuses getegid (syscall 43): it answers -1, the cache was off in every WebKit GPU process
+// (Safari's held 0 files while other processes held thousands) and every page with WebGL compiled all its pipelines again
+// after each reload or GPU-process start. A refused getegid answers the real group id instead.
+static gid_t nvmtl_getegid(void)
+{
+    static long long cached = -2;
+    long long g = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    if (g == -2) { gid_t e = getegid(); g = (e == (gid_t)-1) ? (long long)getgid() : (long long)e; __atomic_store_n(&cached, g, __ATOMIC_RELAXED); }
+    return (gid_t)g;
+}
 // Point one imported symbol of the image that holds `inside` at `repl` (its lazy and non-lazy pointers). Returns how
 // many pointers were changed. The driver's own dylib only: nothing else in the process is touched.
 static int nvmtl_rebind_import(const void *inside, const char *symbol, void *repl)
@@ -746,6 +757,8 @@ static int nvmtl_vk_initialize(void)
             nvlog("vk: driver opened directly: %s (image %s)", NVMTL_ICD_LIB, nvmtl_image_ident((const void *)pvkGetInstanceProcAddr, vid, sizeof vid));
             { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_sysconf", (void *)nvmtl_sysconf);
               if (rb <= 0) nvlog("vk: memory-size fallback missing: _sysconf not rebound in %s (%d) -- sandboxed apps may have no device", NVMTL_ICD_LIB, rb); }
+            { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_getegid", (void *)nvmtl_getegid);
+              if (rb <= 0) nvlog("vk: mc1 getegid not rebound in %s (%d) -- Mesa's disk cache stays off in sandboxes that refuse it", NVMTL_ICD_LIB, rb); }
             if (nvmtl_vk_vendor() == 0x10de) { int rb = nvmtl_rebind_import((const void *)pvkGetInstanceProcAddr, "_open", (void *)nvmtl_icd_open);
               if (rb <= 0) nvlog("vk: owned handle fallback missing: _open not rebound in %s (%d)", NVMTL_ICD_LIB, rb); }
             pnvk_stage_import = (void (*)(const nvmtl_vram_rec *))dlsym(g_lib, "nvmtl_nvk_stage_import");
