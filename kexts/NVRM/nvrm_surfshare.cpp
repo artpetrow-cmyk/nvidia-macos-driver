@@ -66,3 +66,34 @@ extern "C" int nvrm_surfshare_pageoff(struct NVRMSurfPageoff *p, void *nv)
     p->usec = us;
     return 0;
 }
+
+static volatile SInt64 gSsClearOk, gSsClearFail, gSsClearUsSum, gSsClearUsMax;
+SYSCTL_QUAD(_debug, OID_AUTO, nvrm_ce_clear_ok, CTLFLAG_RD | CTLFLAG_LOCKED, (long long *)&gSsClearOk, "VRAM grants cleared on the copy engine");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrm_ce_clear_fail, CTLFLAG_RD | CTLFLAG_LOCKED, (long long *)&gSsClearFail, "copy-engine clears that failed (the caller clears by CPU)");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrm_ce_clear_us_sum, CTLFLAG_RD | CTLFLAG_LOCKED, (long long *)&gSsClearUsSum, "microseconds spent in copy-engine clears");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrm_ce_clear_us_max, CTLFLAG_RD | CTLFLAG_LOCKED, (long long *)&gSsClearUsMax, "the slowest copy-engine clear, us");
+static volatile SInt32 gSsClearSysctl = 0;
+extern "C" NV_STATUS nvrm_ce_memset(void *nv, NvU32 hClient, NvU32 hMemory, NvU64 length, NvU64 *pUsec);
+extern "C" int nvrm_surfshare_clear(struct NVRMSurfClear *p, void *nv)
+{
+    if (!p || p->version != NVRM_SS_RM_VERSION) { if (p) p->status = NVRM_SS_BAD_VERSION; return 0; }
+    unsigned int c = 0, d = 0, s = 0;
+    if (!p->kapiDevice || !p->kapiMemory || !nvrm_kapi_dev_handles(p->kapiDevice, &c, &d, &s) || !c) { p->status = NVRM_SS_OFF; return 0; }
+    unsigned int m = nvrm_kapi_mem_handle(p->kapiMemory);
+    if (!m) { p->status = NVRM_SS_NO_VRAM; return 0; }
+    if (OSCompareAndSwap(0, 1, &gSsClearSysctl)) {
+        sysctl_register_oid(&sysctl__debug_nvrm_ce_clear_ok); sysctl_register_oid(&sysctl__debug_nvrm_ce_clear_fail);
+        sysctl_register_oid(&sysctl__debug_nvrm_ce_clear_us_sum); sysctl_register_oid(&sysctl__debug_nvrm_ce_clear_us_max);
+    }
+    NvU64 us = 0;
+    p->status = nvrm_ce_memset(nv, c, m, p->length, &us);
+    p->usec = us;
+    if (p->status == 0) {
+        OSAddAtomic64(1, &gSsClearOk); OSAddAtomic64((SInt64)us, &gSsClearUsSum);
+        if ((SInt64)us > gSsClearUsMax) gSsClearUsMax = (SInt64)us;
+    } else if (OSAddAtomic64(1, &gSsClearFail) < 8) {
+        kprintf("NVRM-xnu: nvSurfClear: %llu bytes on the copy engine FAILED (NV_STATUS 0x%x)\n", p->length, p->status);
+        IOLog("NVRM-xnu: nvSurfClear: %llu bytes on the copy engine FAILED (NV_STATUS 0x%x)\n", p->length, p->status);
+    }
+    return 0;
+}
