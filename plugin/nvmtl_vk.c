@@ -2208,9 +2208,20 @@ typedef struct { uint8_t kind; void *h; size_t off; size_t size; uint64_t addres
 #define NVMTL_EMB_KEYMAX 480
 // dsr1: descriptor sets of a retired command buffer go to a free list instead of back to their pool, and the next command
 // buffer takes them from there - in WindowServer nvk_AllocateDescriptorSets was ~1 % of the main thread under load
-// (spindump 13.10). Every set has the one layout g_setLayout, a set is reused only after the GPU finished the buffer that
-// used it (as a freed-and-reallocated one is today), and its contents are undefined until written either way.
+// (spindump 13.10). Only sets of the one layout g_setLayout are kept, a set is reused only after the GPU finished the buffer
+// that used it (as a freed-and-reallocated one is today), and its contents are undefined until written either way.
 // NVMTL_DESC_RECYCLE=0: off. All of it runs under g_desc_lock.
+// Since 2.3.4 the command buffer's set list also holds the framebuffer-fetch sets (layout g_fetchLayout, eight input
+// attachments, from g_fetchPools). Recycled as ordinary sets, a whole bind table was written into an eight-descriptor set:
+// NVK's descriptor memory was overrun and the GPU read garbage descriptors - device lost, then RenderBox crashed on nil
+// command buffers in every process that draws icons with [[color(n)]] (Dock, Spotlight, iconservicesagent, SecurityAgent).
+// Those sets go straight back to their own pool.
+static VkDescriptorPool g_fetchPools[64]; static unsigned g_nfetchPools;
+static int nvmtl_fetch_pool_locked(void *pool)
+{
+    for (unsigned k = 0; k < g_nfetchPools; k++) if ((void *)g_fetchPools[k] == pool) return 1;
+    return 0;
+}
 #define NVMTL_SET_FREE_MAX 8192
 static nvk_setref g_setFree[NVMTL_SET_FREE_MAX];
 static unsigned g_nsetFree;
@@ -2225,8 +2236,9 @@ static int nvmtl_desc_recycle_on(void)
 // a retired set: onto the free list, or back to its pool when the list is full (caller holds g_desc_lock)
 static void nvmtl_dsr_put_locked(void *pool, void *set)
 {
-    if (nvmtl_desc_recycle_on() && g_nsetFree < NVMTL_SET_FREE_MAX) { g_setFree[g_nsetFree++] = (nvk_setref){ pool, set }; return; }
-    if (nvmtl_desc_recycle_on()) g_dsrOverflow++;
+    const int fetch = nvmtl_fetch_pool_locked(pool);   // another layout: never on the free list
+    if (!fetch && nvmtl_desc_recycle_on() && g_nsetFree < NVMTL_SET_FREE_MAX) { g_setFree[g_nsetFree++] = (nvk_setref){ pool, set }; return; }
+    if (!fetch && nvmtl_desc_recycle_on()) g_dsrOverflow++;
     VkDescriptorSet one = (VkDescriptorSet)set;
     pvkFreeDescriptorSets(g_dev, (VkDescriptorPool)pool, 1, &one);
 }
@@ -3217,7 +3229,6 @@ static VkSampleLocationsInfoEXT nvmtl_sample_info(const nvmtl_sample_pattern *p,
 #define NVMTL_FETCH_SET 3
 #define NVMTL_FETCH_BINDING 192
 static VkDescriptorSetLayout g_fetchLayout, g_emptyLayout;
-static VkDescriptorPool g_fetchPools[64]; static unsigned g_nfetchPools;
 static int nvmtl_fbfetch_on(void)
 {
     static int on = -1;
