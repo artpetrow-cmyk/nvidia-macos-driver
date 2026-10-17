@@ -41,6 +41,27 @@ extern "C" bool nvrm_query_gpu_profile(NvU32 gpuId, NvU32 *pArch, NvU32 *pImpl, 
                                        NvU32 *pClsCopy, NvU32 *pClsEnc, NvU32 *pClsDec, NvU32 *pStatus);
 #include "nvrm_gpustats_abi.h"
 extern "C" bool nvrm_gpu_stats(NvU32 gpuId, struct NvrmGpuStats *out);   // gst1, nvrm_gpustats.cpp
+#include <sys/sysctl.h>
+// gpr1: GPU time for WindowServer, set on every new channel group in RM's escape.c (patches/610-rm-gpr1-gpu-priority.patch)
+extern "C" { extern NvU32 nvrm_gpr_on, nvrm_gpr_app_us, nvrm_gpr_ws_us, nvrm_gpr_ws_level,
+                          nvrm_gpr_ws_groups, nvrm_gpr_app_groups, nvrm_gpr_refused, nvrm_gpr_last_rc; }
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_on, CTLFLAG_RW | CTLFLAG_LOCKED, &nvrm_gpr_on, 0, "gpr1: set the timeslice and interleave level of new channel groups");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_app_us, CTLFLAG_RW | CTLFLAG_LOCKED, &nvrm_gpr_app_us, 0, "gpr1: timeslice of a new channel group outside WindowServer, us (0: RM default 1024)");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_ws_us, CTLFLAG_RW | CTLFLAG_LOCKED, &nvrm_gpr_ws_us, 0, "gpr1: timeslice of a new WindowServer channel group, us (0: RM default 1024)");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_ws_level, CTLFLAG_RW | CTLFLAG_LOCKED, &nvrm_gpr_ws_level, 0, "gpr1: interleave level of a new WindowServer channel group (0 low, 1 medium, 2 high, 3 RM default)");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_ws_groups, CTLFLAG_RD | CTLFLAG_LOCKED, &nvrm_gpr_ws_groups, 0, "gpr1: WindowServer channel groups seen");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_app_groups, CTLFLAG_RD | CTLFLAG_LOCKED, &nvrm_gpr_app_groups, 0, "gpr1: other channel groups seen");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &nvrm_gpr_refused, 0, "gpr1: channel groups where RM refused a setting");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_last_rc, CTLFLAG_RD | CTLFLAG_LOCKED, &nvrm_gpr_last_rc, 0, "gpr1: RM status of the last refusal");
+static void nvrm_gpr_sysctl_register(void)
+{
+    static bool done; if (done) return; done = true;
+    { int v = 0; if (PE_parse_boot_argn("-nvrmnogpr", &v, sizeof v)) nvrm_gpr_on = 0; }   // RM's scheduling defaults from boot
+    sysctl_register_oid(&sysctl__debug_nvrm_gpr_on); sysctl_register_oid(&sysctl__debug_nvrm_gpr_app_us);
+    sysctl_register_oid(&sysctl__debug_nvrm_gpr_ws_us); sysctl_register_oid(&sysctl__debug_nvrm_gpr_ws_level);
+    sysctl_register_oid(&sysctl__debug_nvrm_gpr_ws_groups); sysctl_register_oid(&sysctl__debug_nvrm_gpr_app_groups);
+    sysctl_register_oid(&sysctl__debug_nvrm_gpr_refused); sysctl_register_oid(&sysctl__debug_nvrm_gpr_last_rc);
+}
 kern_return_t _start(kmod_info_t *ki, void *data);
 kern_return_t _stop(kmod_info_t *ki, void *data);
 KMOD_EXPLICIT_DECL(com.nullmoth.NVRM, "0.1", _start, _stop)
@@ -409,6 +430,7 @@ bool NVRM::start(IOService *provider)
             sysctl_register_oid(&sysctl__debug_nvrm_pm_waited);
         }
     }
+    nvrm_gpr_sysctl_register();
     UInt8 bus = fPCI->getBusNumber(), dev = fPCI->getDeviceNumber(), fn = fPCI->getFunctionNumber();
     nv_xnu_register_pci(fPCI, 0, bus, dev, fn);
     nv_xnu_register_all_pci();   // RM's chipset init needs the whole PCI tree (host bridge, root ports)
