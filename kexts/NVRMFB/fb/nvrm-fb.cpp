@@ -51,6 +51,8 @@ extern "C" {
 }
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
+#define NVRM_SS_KERNEL_ABI 1
+#include "nvrm_surfshare_abi.h"
 
 // Surfaces may use half of a resizable BAR1 (>= 4 GB) and three quarters of a smaller one. WAS: a fixed 192 MB below
 // 4 GB, which is 3/4 of the 256 MB firmware window but left a 512 MB or 1 GB BAR1 no better off (issue #27).
@@ -114,7 +116,8 @@ static inline void nvu_copy(void *d, const void *s, size_t n) { __asm__ __volati
 static inline void nvu_zero_wide(void *p, size_t n) { size_t q = n >> 3; __asm__ __volatile__("rep stosq" : "+D"(p), "+c"(q) : "a"(0ull) : "memory"); nvu_zero(p, n & 7); }
 #define FBTRACE(buf) do { trace(buf); } while (0)
 #define FBSEL(a) char _s[5] = { (char)((a) >> 24), (char)((a) >> 16), (char)((a) >> 8), (char)(a), 0 }
-#define FBLOG(fmt, ...) do { IOLog("NVRM-fb: " fmt "\n", ##__VA_ARGS__); kprintf("NVRM-fb: " fmt "\n", ##__VA_ARGS__); \
+// log1: IOLog only - on macOS 26 kprintf output lands in the unified log as well, so IOLog + kprintf wrote every line twice
+#define FBLOG(fmt, ...) do { IOLog("NVRM-fb: " fmt "\n", ##__VA_ARGS__); \
     { char _tb[220]; snprintf(_tb, sizeof _tb, fmt, ##__VA_ARGS__); FBTRACE(_tb); } } while (0)
 static const char kPixelFormats[] = IO32BitDirectPixels "\0";
 static const IODisplayModeID kModeId = 1;
@@ -289,6 +292,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     NvU32 fCurMaxPx = 0, fCurCompModes = 0;
     SInt32 fCurX = 0, fCurY = 0; bool fCurVisible = false; bool fCurHaveImage = false;
     unsigned fCurApplies = 0; int fCurRc = 0;
+    UInt32 *fCurStaging = nullptr, *fCurShadow = nullptr; unsigned fCurPrevW = 0, fCurPrevH = 0;   // cur1
     bool fCursorEnabled = false;
     bool cursorInit();
     bool cursorApply();
@@ -318,6 +322,8 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     static void hwVblIntr(NvU64 param, NvU64 timestamp);
     static void hwVblDeliver(thread_call_param_t p0, thread_call_param_t);
     uint64_t vblPeriodAbs();
+    volatile uint64_t fLatchAt = 0;   // abs time of this head's last timed flip latch (waitFlipDone)
+    uint64_t vblLockedNext(uint64_t now, uint64_t period);
     thread_call_t fBars = nullptr;
     struct NVFlipEntry { struct NvKmsKapiMemory *mem; struct NvKmsKapiSurface *surf;
                          unsigned w, h, pitch; UInt64 epoch, cookie; struct NvKmsKapiMemory *pin; };
@@ -327,6 +333,8 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     struct NvKmsKapiSurface *fFrontSurf = nullptr;
     static inline volatile SInt32 sFlipLatched[8] = {};
     bool flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure = false, UInt64 cookie = 0);
+    bool flipToMemoryGated(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure,
+                           UInt64 cookie, bool *deferred, uint64_t *submittedAt);
     bool fSubmissionSeen = false, fSubmissionFaulted = false;
     // When the tracked flip was committed, so a flip still pending can be told late (another period will do) from
     // stuck (kFlipStuckUs since its submit, the head is faulted).
@@ -336,9 +344,13 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     uint64_t flipWaitUs();
     int priorFlipState();
     void publishFlipWait();
+    volatile bool fFlipInFlight = false;   // flip_unlocked_wait: a pure flip whose landing flipToMemory waits for outside the gate
+    bool waitFlipLatched(bool outsideGate, bool frame);
     unsigned fRejected = 0;     // commits NVKMS refused on this head, for NVRMRejectedCommits
+    struct AttrSeen { uint64_t key; IOReturn r; uintptr_t v; uint64_t n; } fAttrSeen[12] = {};   // log1
+    uint64_t attrLogCount(unsigned kind, IOSelect sel, IOReturn r, uintptr_t v);
     NvBool submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg, struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit,
-                        bool bootstrap = false, bool cursorOnly = false, bool frame = false);
+                        bool bootstrap = false, bool cursorOnly = false, bool frame = false, bool deferWait = false);
     thread_call_t fReflip = nullptr;
     unsigned fReflips = 0; int fReflipRc = -99;
     unsigned fVblReg = 0;
@@ -391,8 +403,9 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     static void hotplugKick();
     static void hotplugFire(thread_call_param_t p0, thread_call_param_t);
     static void flipWake(unsigned head);
-    bool waitFlipDone(uint64_t limitUs);
+    bool waitFlipDone(uint64_t limitUs, bool *unknown = nullptr);
     void flipFaultLog(const char *why);
+    void bar1FullLog(SInt64 budget);
     bool kapiInit();
     bool applyMode();
     void hudDraw();
@@ -428,6 +441,8 @@ public:
     IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction,
                                   void *param1, void *param2, void *param3, void *param4) APPLE_KEXT_OVERRIDE;
     bool     vramGrant(struct NVRMVramRequest *r);
+    void     noteGrantTiming(NvU64 bytes, uint64_t t0, uint64_t tGate, uint64_t tMapped, uint64_t tZeroed, uint64_t tEnd);
+    bool     ceClear(struct NvKmsKapiMemory *mem, NvU64 bytes);
     bool     vramRelease(struct NVRMVramRequest *r);
     uint32_t fVramGrantLogged = 0;
     uint32_t fVramGrants = 0;
@@ -465,6 +480,26 @@ struct nvrm_dpy_rec {
     NvU32 edidSize; NvU8 edid[NVKMS_KAPI_EDID_BUFFER_SIZE];
 };
 static struct NvKmsKapiDevice *gDev;
+// Set once framebufferConsoleDisabled() has run: NVKMS has unregistered the GOP console surface and RM
+// (NV0076_CTRL_CMD_NOTIFY_CONSOLE_DISABLED) has dropped its mapping, so its BAR1 range is ordinary free space.
+static volatile bool gConsoleReleased = false;
+// Presentation pacing on Turing: nvEvoC5 (nvdisplay 3.x) has no SetupVBlankRgSemaphoreInterrupt, so NVKMS registers no
+// vblank callback and every head's VBL is the timer in vblFire, free-running at the mode's nominal period. (The RG line
+// counter at BAR0 0x616330 + head * 0x800, which NVRM's boot-raster probe reads, reads 0 once NVKMS has set the mode.)
+//   debug.nvrmfb_vbl_lock (on; boot-arg nvfbvbllock=0 turns it off): the timer is re-phased to the head's last observed flip latch.
+//     A pure flip's completion notifier is written by the display engine at the vblank that latched it; the poll in
+//     waitFlipDone sees it turn from pending to done (woken by the flip-occurred event), and the middle of that step is kept.
+//   debug.nvrmfb_flip_unlocked_wait (on; boot-arg nvfbflipwait=0 turns it off): a pure flip waits for its latch outside the display
+//     gate, so one head's wait for its vblank no longer holds up the other head's flips and every VRAM grant/release.
+static int gVblLock = 1, gFlipUnlockedWait = 1;
+static volatile SInt64 gCntVblLocked, gCntVblNoLatch, gCntLatchSeen, gCntFlipUnlocked, gCntFlipWaitFallback;
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vbl_lock, CTLFLAG_RW | CTLFLAG_LOCKED, &gVblLock, 0, "1 = the timer VBL is re-phased to the last flip latch");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_unlocked_wait, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipUnlockedWait, 0, "1 = pure flips wait for their latch outside the display gate");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vbl_locked, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntVblLocked, "VBL ticks scheduled from a flip latch");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vbl_no_latch, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntVblNoLatch, "VBL ticks left free-running (no latch in the last 2 s)");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vbl_latch_seen, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntLatchSeen, "flip latches timed by the pending-to-done step");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flip_unlocked, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipUnlocked, "pure flips waited for outside the display gate");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flip_wait_fallback, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntFlipWaitFallback, "unlocked waits that fell back to the gated wait");
 static struct nvrm_dpy_rec gDpy[NVKMS_KAPI_MAX_CONNECTORS * 2];
 static int gNDpy = -1;
 // How many displays the boot enumeration found. A framebuffer whose display index is >= this exists because a display
@@ -1352,15 +1387,22 @@ void NVRMNVDAFramebuffer::flipWake(unsigned head)
 {
     if (head < 8 && sFlipWaitLock) IOLockWakeup(sFlipWaitLock, (event_t)&sFlipWakeEv[head], false);
 }
-bool NVRMNVDAFramebuffer::waitFlipDone(uint64_t limitUs)
+bool NVRMNVDAFramebuffer::waitFlipDone(uint64_t limitUs, bool *unknown)
 {
     if (!sFlipWaitLock) { IOLock *l = IOLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&sFlipWaitLock)) IOLockFree(l); }
     uint64_t end = 0; clock_interval_to_deadline(limitUs > 0xffffffffull ? 0xffffffffu : (uint32_t)limitUs, kMicrosecondScale, &end);
+    uint64_t pendingAt = 0;
     for (;;) {
         NvBool pending = NV_TRUE;
-        if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) return false;
-        if (!pending) return true;
+        if (!fKms->getFlipPendingStatus(fDev, fHead, NVKMS_KAPI_LAYER_PRIMARY_IDX, &pending)) { if (unknown) *unknown = true; return false; }
         uint64_t now = mach_absolute_time();
+        if (!pending) {
+            // vbl_lock: the flip landed between the last pending read and this one (the flip-occurred event ends the
+            // sleep, so the step is short); its middle is kept in fLatchAt for vblLockedNext.
+            if (pendingAt) { fLatchAt = pendingAt + (now - pendingAt) / 2; OSAddAtomic64(1, &gCntLatchSeen); }
+            return true;
+        }
+        pendingAt = now;
         if (now >= end) return false;
         uint64_t next = 0; clock_interval_to_deadline(250, kMicrosecondScale, &next);
         if (next > end) next = end;
@@ -1465,7 +1507,7 @@ void NVRMNVDAFramebuffer::flipFaultLog(const char *why)
 }
 NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg,
                                             struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit, bool bootstrap,
-                                            bool cursorOnly, bool frame)
+                                            bool cursorOnly, bool frame, bool deferWait)
 {
     if (!fKms || !fDev || !cfg || !rep || fHead >= 8 || fSubmissionFaulted) return NV_FALSE;
     if (!commit) return fKms->applyModeSetConfig(fDev, cfg, rep, NV_FALSE);
@@ -1527,36 +1569,57 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
     fFlipSubmitAbs = submit0;
     // Initial acceptance permits console handoff, never surface retirement. The owned boot surface remains pinned.
     if (bootstrap || !gFlipLatch) return NV_TRUE;
-    OSIncrementAtomic((volatile SInt32 *)&gFlipLatchWaits);
-    const uint64_t latch0 = mach_absolute_time();
-    if (waitFlipDone(flipWaitUs())) {
+    // The caller (flipToMemory) waits for this flip with waitFlipLatched once it has left the gate.
+    if (deferWait) return NV_TRUE;
+    return waitFlipLatched(false, frame) ? NV_TRUE : NV_FALSE;
+}
+
+// Waits for the primary-layer flip last submitted on this head to reach the panel: one refresh period and a quarter
+// (flipWaitUs), then on as a late flip until kFlipStuckUs after its submit, when the head is taken as faulted. Inside the
+// gate this is submitConfig's own wait. Outside it (flip_unlocked_wait) the same wait runs unlocked; if NVKMS cannot
+// report the status there (a modeset may be reshaping the head) or the flip reaches the stuck limit, the gate is taken
+// and the gated wait decides, so the presentation path faults only where it faulted before.
+bool NVRMNVDAFramebuffer::waitFlipLatched(bool outsideGate, bool frame)
+{
+    if (!outsideGate) OSIncrementAtomic((volatile SInt32 *)&gFlipLatchWaits);
+    const uint64_t latch0 = mach_absolute_time(), submit0 = fFlipSubmitAbs;
+    bool unknown = false;
+    if (waitFlipDone(flipWaitUs(), &unknown)) {
         uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - latch0, &ns);
         const int us = (int)(ns / 1000);
         if (us > gFlipLatchMaxUs) gFlipLatchMaxUs = us;
         if (frame && presentStatsNote(fHead, flipWaitUs(), true, false, false, (uint32_t)us)) PRESENT_STATS_LOG();
-        return NV_TRUE;
+        fFlipInFlight = false; return true;
     }
-    OSIncrementAtomic((volatile SInt32 *)&gFlipLatchTimeouts);
-    // Past one period the flip is late, not lost, and the wait goes on: until it lands the panel may still scan the
-    // surface it replaces, and the caller completes the transaction (WindowServer then reuses that surface) as soon as
-    // this returns. On the frame path the caller is the accelerator's swap worker, which WindowServer does not wait on
-    // past its own one-period bound. Past the stuck limit both the old front and the submitted surface stay alive until
-    // a proven recovery or reboot.
-    if (frame && (++fLatchLateLogs <= 8 || (fLatchLateLogs % 64) == 0))
-        FBLOG("flip on head %u not on the panel within %llu us (#%u) - waiting for it to land",
-              fHead, (unsigned long long)flipWaitUs(), fLatchLateLogs);
-    for (;;) {
-        if (waitFlipDone(flipWaitUs())) {
-            // a late flip is reported with the whole wait it took, not the period it first missed
-            uint64_t late = 0; absolutetime_to_nanoseconds(mach_absolute_time() - latch0, &late);
-            if (frame && presentStatsNote(fHead, flipWaitUs(), true, true, false, (uint32_t)(late / 1000))) PRESENT_STATS_LOG();
-            return NV_TRUE;
+    if (!(unknown && outsideGate)) {
+        OSIncrementAtomic((volatile SInt32 *)&gFlipLatchTimeouts);
+        // Past one period the flip is late, not lost, and the wait goes on: until it lands the panel may still scan the
+        // surface it replaces, and the caller completes the transaction (WindowServer then reuses that surface) as soon as
+        // this returns. On the frame path the caller is the accelerator's swap worker, which WindowServer does not wait on
+        // past its own one-period bound. Past the stuck limit both the old front and the submitted surface stay alive until
+        // a proven recovery or reboot.
+        if (frame && (++fLatchLateLogs <= 8 || (fLatchLateLogs % 64) == 0))
+            FBLOG("flip on head %u not on the panel within %llu us (#%u) - waiting for it to land",
+                  fHead, (unsigned long long)flipWaitUs(), fLatchLateLogs);
+        for (;;) {
+            if (waitFlipDone(flipWaitUs(), &unknown)) {
+                // a late flip is reported with the whole wait it took, not the period it first missed
+                uint64_t late = 0; absolutetime_to_nanoseconds(mach_absolute_time() - latch0, &late);
+                if (frame && presentStatsNote(fHead, flipWaitUs(), true, true, false, (uint32_t)(late / 1000))) PRESENT_STATS_LOG();
+                fFlipInFlight = false; return true;
+            }
+            if (unknown && outsideGate) break;
+            uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - submit0, &ns);
+            if (ns / 1000 >= kFlipStuckUs) break;
         }
-        uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - submit0, &ns);
-        if (ns / 1000 >= kFlipStuckUs) break;
+    }
+    if (outsideGate) {
+        OSAddAtomic64(1, &gCntFlipWaitFallback);
+        NVRMDisplayGate gate; if (!gate.valid()) return false;
+        return waitFlipLatched(false, frame);
     }
     flipFaultLog("submitted completion unavailable");
-    fSubmissionFaulted = true; return NV_FALSE;
+    fSubmissionFaulted = true; return false;
 }
 
 void NVRMNVDAFramebuffer::sampleFire(thread_call_param_t p0, thread_call_param_t)
@@ -1814,30 +1877,19 @@ bool NVRMNVDAFramebuffer::cursorApply()
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     return success;
 }
-static bool nvrmPackCursor(UInt32 *dst, unsigned dim, const UInt32 *src,
-                           unsigned width, unsigned height)
-{
-    if (!dst || !src || !width || !height || width > dim || height > dim || dim > 256)
-        return false;
-    nvu_zero(dst, (size_t)dim * dim * sizeof(*dst));
-    for (unsigned y = 0; y < height; ++y) {
-        for (unsigned x = 0; x < width; ++x) {
-            UInt32 p = src[y * width + x], a = p >> 24;
-            UInt32 r = (((p >> 16) & 255) * a + 127) / 255;
-            UInt32 g = (((p >> 8) & 255) * a + 127) / 255;
-            UInt32 b = ((p & 255) * a + 127) / 255;
-            dst[y * dim + x] = (a << 24) | (r << 16) | (g << 8) | b;
-        }
-    }
-    return true;
-}
+// cur1: a new cursor shape used to clear and rewrite the whole 256x256 plane (256 KB through the kernel mapping of VRAM)
+// for an 8x8 or 32x64 image, allocate and zero a 256 KB staging buffer, and commit the cursor to NVKMS again - 3.5 % of
+// WindowServer's main thread under load (spindump 13.10, IOFBSetNewCursor). Now the image is premultiplied into a RAM
+// shadow of the plane, only the rows and columns covered by the new or the previous image are written to the plane, an
+// unchanged image writes nothing, and the plane - scanned out in place - is committed only when the cursor had no image
+// showing (or the last commit failed). Both buffers live as long as the cursor plane.
 IOReturn NVRMNVDAFramebuffer::setCursorImage(void *cursorImage)
 {
     if (!fCurKva || !fCurSurf) return kIOReturnUnsupported;
-    size_t bytes = (size_t)fCurDim * fCurDim * sizeof(UInt32);
-    UInt32 *staging = (UInt32 *)IOMalloc(bytes);
-    if (!staging) return kIOReturnNoMemory;
-    nvu_zero(staging, bytes);
+    const size_t bytes = (size_t)fCurDim * fCurDim * sizeof(UInt32);
+    if (!fCurStaging) fCurStaging = (UInt32 *)IOMalloc(bytes);
+    if (!fCurShadow) { fCurShadow = (UInt32 *)IOMalloc(bytes); if (fCurShadow) nvu_zero(fCurShadow, bytes); }
+    if (!fCurStaging || !fCurShadow) return kIOReturnNoMemory;
     IOHardwareCursorDescriptor d; nvu_zero(&d, sizeof d);
     d.majorVersion = kHardwareCursorDescriptorMajorVersion;
     d.minorVersion = kHardwareCursorDescriptorMinorVersion;
@@ -1847,12 +1899,10 @@ IOReturn NVRMNVDAFramebuffer::setCursorImage(void *cursorImage)
     IOHardwareCursorInfo ci; nvu_zero(&ci, sizeof ci);
     ci.majorVersion = kHardwareCursorInfoMajorVersion;
     ci.minorVersion = kHardwareCursorInfoMinorVersion;
-    ci.hardwareCursorData = (UInt8 *)staging;
-    bool converted = convertCursorImage(cursorImage, &d, &ci);
-    bool packed = converted && nvrmPackCursor((UInt32 *)fCurKva, fCurDim, staging,
-                                               ci.cursorWidth, ci.cursorHeight);
-    IOFree(staging, bytes);
-    if (!packed) {
+    ci.hardwareCursorData = (UInt8 *)fCurStaging;
+    const bool converted = convertCursorImage(cursorImage, &d, &ci);
+    const unsigned w = converted ? (unsigned)ci.cursorWidth : 0, h = converted ? (unsigned)ci.cursorHeight : 0;
+    if (!converted || !w || !h || w > fCurDim || h > fCurDim) {
         bool hadImage = fCurHaveImage;
         fCurHaveImage = false;
         if (hadImage) cursorApply();
@@ -1860,12 +1910,48 @@ IOReturn NVRMNVDAFramebuffer::setCursorImage(void *cursorImage)
         if (++refused <= 4) FBLOG("cursor conversion declined %u (discovery or unsupported image)", refused);
         return kIOReturnUnsupported;
     }
-    __asm__ __volatile__("sfence" ::: "memory");
+    const unsigned rw = w > fCurPrevW ? w : fCurPrevW, rh = h > fCurPrevH ? h : fCurPrevH;
+    unsigned firstRow = rh, lastRow = 0;
+    for (unsigned y = 0; y < rh; ++y) {
+        UInt32 *sh = fCurShadow + (size_t)y * fCurDim;
+        bool rowChanged = false;
+        for (unsigned x = 0; x < rw; ++x) {
+            UInt32 v = 0;
+            if (y < h && x < w) {
+                const UInt32 p = fCurStaging[y * w + x], a = p >> 24;
+                const UInt32 r = (((p >> 16) & 255) * a + 127) / 255;
+                const UInt32 g = (((p >> 8) & 255) * a + 127) / 255;
+                const UInt32 b = ((p & 255) * a + 127) / 255;
+                v = (a << 24) | (r << 16) | (g << 8) | b;
+            }
+            if (sh[x] != v) { sh[x] = v; rowChanged = true; }
+        }
+        if (rowChanged) { if (y < firstRow) firstRow = y; lastRow = y; }
+    }
+    fCurPrevW = w; fCurPrevH = h;
+    static SInt32 sImages, sSkipped, sCommits;
+    const SInt32 nImg = OSIncrementAtomic(&sImages) + 1;
+    if (firstRow <= lastRow) {
+        UInt32 *plane = (UInt32 *)fCurKva;
+        for (unsigned y = firstRow; y <= lastRow; ++y) {
+            const UInt32 *sh = fCurShadow + (size_t)y * fCurDim;
+            UInt32 *row = plane + (size_t)y * fCurDim;
+            for (unsigned x = 0; x < rw; ++x) row[x] = sh[x];
+        }
+        __asm__ __volatile__("sfence" ::: "memory");
+    } else {
+        OSIncrementAtomic(&sSkipped);
+    }
+    if (nImg <= 4) FBLOG("K8 cursor image %d: %ux%u hot %u,%u plane %u, rows %u-%u written",
+        (int)nImg, w, h, (unsigned)ci.cursorHotSpotX, (unsigned)ci.cursorHotSpotY, fCurDim,
+        firstRow <= lastRow ? firstRow : 0, firstRow <= lastRow ? lastRow : 0);
+    const bool hadImage = fCurHaveImage;
     fCurHaveImage = true;
-    static unsigned images;
-    if (++images <= 4) FBLOG("K8 cursor image %u: %ux%u hot %u,%u plane %u",
-        images, (unsigned)ci.cursorWidth, (unsigned)ci.cursorHeight,
-        (unsigned)ci.cursorHotSpotX, (unsigned)ci.cursorHotSpotY, fCurDim);
+    if (hadImage && fCurRc == NV_KMS_FLIP_RESULT_SUCCESS) {
+        if ((nImg & 1023) == 0) FBLOG("cur1: %d cursor images, %d unchanged, %d committed", (int)nImg, (int)sSkipped, (int)sCommits);
+        return kIOReturnSuccess;
+    }
+    OSIncrementAtomic(&sCommits);
     if (!cursorApply()) { fCurHaveImage = false; cursorApply(); return kIOReturnUnsupported; }
     return kIOReturnSuccess;
 }
@@ -1985,10 +2071,29 @@ void NVRMNVDAFramebuffer::vblFire(thread_call_param_t p0, thread_call_param_t)
     uint64_t period = 0, now = 0;
     period = me->vblPeriodAbs();
     clock_get_uptime(&now);
-    if (me->fVblNext == 0) me->fVblNext = now;
-    me->fVblNext += period;
-    if (me->fVblNext <= now) me->fVblNext = now + period;
+    if (const uint64_t locked = me->vblLockedNext(now, period)) {
+        me->fVblNext = locked;
+    } else {
+        if (me->fVblNext == 0) me->fVblNext = now;
+        me->fVblNext += period;
+        if (me->fVblNext <= now) me->fVblNext = now + period;
+    }
     me->scheduleCall(me->fVblTimer, me->fVblNext);
+}
+// When the next VBL is due if it keeps the phase of this head's last flip latch: the first latch-phase moment at least half
+// a period away (nearer than that, this tick already stood for it). Between flips the nominal period carries the phase;
+// at 59.999 vs 60.000 Hz that drifts ~0.3 us a frame. 0 = switch off, no mode, or no latch in the last 2 s: free-running.
+uint64_t NVRMNVDAFramebuffer::vblLockedNext(uint64_t now, uint64_t period)
+{
+    if (!gVblLock || !fModeSet || fConsoleAperture || !period) return 0;
+    const uint64_t at = fLatchAt;
+    uint64_t window = 0; nanoseconds_to_absolutetime(2000000000ull, &window);
+    if (!at || at > now || now - at > window) { OSAddAtomic64(1, &gCntVblNoLatch); return 0; }
+    uint64_t next = at + ((now - at) / period + 1) * period;
+    if (next - now < period / 2) next += period;
+    if (OSAddAtomic64(1, &gCntVblLocked) == 0)
+        FBLOG("VBL on head %u now keeps the phase of its flip latches (next in %llu abs, period %llu)", fHead, next - now, period);
+    return next;
 }
 bool NVRMNVDAFramebuffer::setHeadActive(bool active)
 {
@@ -2099,7 +2204,11 @@ bool NVRMNVDAFramebuffer::applyMode()
     FBLOG("applyModeSetConfig -> %u (flipResult %d)", ok, (int)rep->flipResult);
     if (ok && fKms->framebufferConsoleDisabled) {
         fKms->framebufferConsoleDisabled(fDev);
-        FBLOG("framebufferConsoleDisabled() sent -- NVKMS releases the old GOP console");
+        if (!gConsoleReleased) {
+            gConsoleReleased = true;
+            FBLOG("framebufferConsoleDisabled() sent -- NVKMS releases the old GOP console; "
+                  "VRAM grants may use its BAR1 range from now on");
+        }
     }
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     fModeSet = ok;
@@ -2884,6 +2993,49 @@ static struct { struct NvKmsKapiMemory *m; void *k; NvU64 n; } gParkedForever[64
 static int      gNParkedForever   = 0;
 static volatile SInt64 gVramParkedBytes = 0;
 static volatile SInt64 gCntGrant, gCntGrantBytes, gCntRelease, gCntReleaseBytes;
+static volatile SInt64 gCntConsoleReuse, gCntParkRolls, gCntParkRejects, gCntBudgetRefused, gCntTableFull;
+static volatile SInt64 gCntGrantTimed, gGrantUsSum, gGrantUsMax, gGrantZeroUsSum, gGrantZeroUsMax, gCntGrantSlow;
+// Who holds the BAR1 window when a grant finds no room in it: grants against releases tell a working set from a leak.
+void NVRMNVDAFramebuffer::bar1FullLog(SInt64 budget)
+{
+    FBLOG("BAR1 full: %lld grants (%lld bytes) vs %lld releases (%lld bytes); live %lld, console parks %lld bytes "
+          "in %d slots, display %lld, budget %lld, BAR1 %llu",
+          (long long)gCntGrant, (long long)gCntGrantBytes, (long long)gCntRelease, (long long)gCntReleaseBytes,
+          (long long)gVramMappedBytes, (long long)gVramParkedBytes, gNParkedForever, (long long)gVramDisplayBytes,
+          (long long)budget, (unsigned long long)fBarLen);
+}
+// Clear each grant on the copy engine (NVRM's nvSurfClear) instead of by CPU through BAR1, which ran at ~50 MB/s:
+// 150-300 ms for every 1080p/1440p surface WindowServer waited on (the stall when a window is grabbed). An NVRM without
+// nvSurfClear, or a failed clear, falls back to the CPU clear. debug.nvrmfb_vram_ce_clear=0 turns it off live.
+static int gVramCeClear = 1;
+static volatile SInt64 gCntCeClears, gCntCpuClears;
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_ce_clear, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramCeClear, 0, "1 = clear VRAM grants on the copy engine");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_ce_clears,  CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntCeClears,  "grants cleared on the copy engine");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_cpu_clears, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntCpuClears, "grants cleared by CPU through BAR1");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_grant_n,          CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntGrantTimed,  "timed VRAM grants");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_grant_us_sum,     CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gGrantUsSum,     "microseconds spent in granted vramGrant calls");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_grant_us_max,     CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gGrantUsMax,     "the slowest granted vramGrant, us");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_grant_clear_us_sum, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gGrantZeroUsSum, "microseconds spent clearing granted memory through BAR1");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_grant_clear_us_max, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gGrantZeroUsMax, "the slowest clear, us");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_grant_slow,       CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntGrantSlow,   "grants that took 4 ms or more");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_table_full, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntTableFull, "grants refused because the allocation table (4096) was full");
+// Transient grants: the BAR1 kernel mapping lives only while vramGrant clears and checks the memory, then it is
+// dropped and the caller gets kva NULL. Nothing on the desktop path reads a grant through BAR1 (flips and NVK go by the
+// kapi memory handle, pageoff by the copy engine), so with a small BAR1 the grants stop being capped by the aperture.
+// On by default in this build; debug.nvrmfb_vram_transient=0 (live) or boot-arg nvfbtransient=0 turns it off.
+#define NVRM_VRAM_TRANSIENT_CEILING (4ull << 30)
+static int gVramTransient = 1;
+static volatile SInt64 gVramTransientBytes = 0;
+static volatile SInt64 gCntTransientGrants, gCntTransientRefused;
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_vram_transient, CTLFLAG_RW | CTLFLAG_LOCKED, &gVramTransient, 0, "1 = new VRAM grants keep no BAR1 mapping");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_transient_bytes,   CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramTransientBytes,  "bytes held by transient grants");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_transient_grants,  CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntTransientGrants,  "transient grants made");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_transient_refused, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntTransientRefused, "transient grants refused by the ceiling");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_parked_bytes,  CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gVramParkedBytes,  "bytes parked off the console range");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_console_reuse, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntConsoleReuse,  "grants placed in the released console range");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_park_rolls,    CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntParkRolls,     "allocations re-rolled because they overlapped the scanout/console");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_park_rejects,  CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntParkRejects,   "re-rolls freed because the park ceiling was reached");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_budget_refused, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntBudgetRefused, "grants refused by the BAR1 budget");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_grants,        CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntGrant,        "vramGrant successes");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_grant_bytes,   CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntGrantBytes,   "bytes granted");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_vram_releases,      CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gCntRelease,      "vramRelease calls");
@@ -2949,6 +3101,28 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_releases); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_release_bytes);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_mapped_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_budget_bytes);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_display_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_display_aware);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_parked_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_console_reuse);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_park_rolls); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_park_rejects);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_budget_refused); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_table_full);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_grant_n); sysctl_register_oid(&sysctl__debug_nvrmfb_grant_us_sum);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_grant_us_max); sysctl_register_oid(&sysctl__debug_nvrmfb_grant_clear_us_sum);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_grant_clear_us_max); sysctl_register_oid(&sysctl__debug_nvrmfb_grant_slow);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_ce_clear); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_ce_clears);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_cpu_clears);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_transient); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_transient_bytes);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vram_transient_grants); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_transient_refused);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vbl_lock); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_unlocked_wait);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vbl_locked); sysctl_register_oid(&sysctl__debug_nvrmfb_vbl_no_latch);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_vbl_latch_seen);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_flip_unlocked); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_wait_fallback);
+    // Present on the command line, a boot-arg sets its switch either way (nvfbtransient=0 is the boot-time way out).
+    { int v = 0; if (PE_parse_boot_argn("nvfbtransient", &v, sizeof v)) gVramTransient = v ? 1 : 0; }
+    { int v = 0; if (PE_parse_boot_argn("nvfbvbllock", &v, sizeof v)) gVblLock = v ? 1 : 0; }
+    { int v = 0; if (PE_parse_boot_argn("nvfbflipwait", &v, sizeof v)) gFlipUnlockedWait = v ? 1 : 0; }
+    IOLog("NVRM-fb: pacing: VBL %s, pure flips wait %s (debug.nvrmfb_vbl_lock / debug.nvrmfb_flip_unlocked_wait)\n",
+          gVblLock ? "re-phased to flip latches" : "free-running timer", gFlipUnlockedWait ? "outside the gate" : "inside the gate");
+    IOLog("NVRM-fb: VRAM grants: %s (debug.nvrmfb_vram_transient, boot-arg nvfbtransient=1)\n",
+          gVramTransient ? "TRANSIENT -- no BAR1 mapping is kept" : "BAR1-mapped for their lifetime");
     sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest); sysctl_register_oid(&sysctl__debug_nvrmfb_vramtest_mode);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_interval); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_sum);
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_n); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_us_max);
@@ -2960,37 +3134,72 @@ static void nvrmfbInstallSysctl(void)
 
 bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
 {
+    const uint64_t tEntry = mach_absolute_time();
     NVRMDisplayGate gate; if (!gate.valid()) return false;
+    const uint64_t tGate = mach_absolute_time();
     nvrmfbInstallSysctl();
     r->phys = 0; r->kva = nullptr; r->handle = nullptr; r->actualSize = 0; r->mappedTotal = 0;
     if (!fKms || !fDev) { FBLOG("nvAllocVram: no NVKMS device yet"); return false; }
     NvU64 want = (r->size + 0xFFFFull) & ~0xFFFFull;
     if (!want) return false;
 
+    // The chunks parked off the console were never handed out; once the console is released its range is
+    // free space, so give them back instead of holding BAR1 (and budget) for the rest of the boot.
+    // Blocks (and guard blocks) held over the scanout stay: the scanout is still in use.
+    if (gConsoleReleased && gNParkedForever > 0) {
+        const int n = gNParkedForever; SInt64 freed = 0; int kept = 0, gone = 0;
+        for (int i = 0; i < n; i++) {
+            const NvU64 bp = (gParkedForever[i].k && fPhysForVa) ? fPhysForVa(gParkedForever[i].k) : 0;
+            const bool overScanout = !bp || (fPhys && fSize && bp < (fPhys + fSize) && (bp + gParkedForever[i].n) > fPhys);
+            if (overScanout) { gParkedForever[kept++] = gParkedForever[i]; continue; }
+            if (gParkedForever[i].k) fKms->unmapMemory(fDev, gParkedForever[i].m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, gParkedForever[i].k);
+            fKms->freeMemory(fDev, gParkedForever[i].m);
+            freed += (SInt64)gParkedForever[i].n; gone++;
+        }
+        for (int i = kept; i < n; i++) { gParkedForever[i].m = nullptr; gParkedForever[i].k = nullptr; gParkedForever[i].n = 0; }
+        gNParkedForever = kept;
+        if (gone) {
+            OSAddAtomic64(-freed, &gVramParkedBytes);
+            FBLOG("nvAllocVram: console released -- un-parked %d chunk(s), %lld bytes back to the pool (%d over the scanout kept)",
+                  gone, (long long)freed, kept);
+        }
+    }
+
     const SInt64 budget = (SInt64)nvrmSurfaceBudget(fBarLen, gVramDisplayBytes);
     gVramBudgetBytes = budget;
-    // Parked blocks keep their BAR1 mapping (see below), so they count against the budget. On a 256 MB BAR1 (every
-    // GTX 16, boards without Resizable BAR) the park ceiling is the smaller one, so surfaces keep most of the budget.
-    SInt64 before = OSAddAtomic64((SInt64)want, &gVramMappedBytes) + gVramParkedBytes;
-    if (before + (SInt64)want > budget) {
-        OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
-        // A full 256 MB window is refused thousands of times in a session (one size, retried every frame: 1,413 lines in
-        // one user log), and each line costs a kernel log write on the path that is already out of room. Log the first
-        // eight, then every 256th with the running count, and say once who holds the window: grants against releases
-        // tell a working set from a leak.
-        static volatile SInt32 refused = 0;
-        const SInt32 nRefused = OSIncrementAtomic(&refused) + 1;
-        if (nRefused <= 8 || (nRefused & 255) == 0)
-            FBLOG("nvAllocVram(%llu): REFUSED (#%d) — BAR1 budget spent (%lld of %llu bytes). "
-                  "This is the resizable-BAR ceiling, not a VRAM shortage.",
-                  (unsigned long long)want, (int)nRefused, (long long)before, (unsigned long long)budget);
-        if (nRefused == 1)
-            FBLOG("BAR1 full: %lld grants (%lld bytes) vs %lld releases (%lld bytes); live %lld, console parks %lld bytes "
-                  "in %d slots, display %lld, budget %lld, BAR1 %llu",
-                  (long long)gCntGrant, (long long)gCntGrantBytes, (long long)gCntRelease, (long long)gCntReleaseBytes,
-                  (long long)gVramMappedBytes, (long long)gVramParkedBytes, gNParkedForever, (long long)gVramDisplayBytes,
-                  (long long)budget, (unsigned long long)fBarLen);
-        return false;
+    // Decided once per grant, so every undo below returns the bytes to the counter they were taken from.
+    const bool transient = gVramTransient != 0;
+    volatile SInt64 *const acct = transient ? &gVramTransientBytes : &gVramMappedBytes;
+    SInt64 before;
+    if (transient) {
+        before = OSAddAtomic64((SInt64)want, &gVramTransientBytes);
+        if (before + (SInt64)want > (SInt64)NVRM_VRAM_TRANSIENT_CEILING) {
+            OSAddAtomic64(-(SInt64)want, &gVramTransientBytes);
+            const SInt64 nref = OSAddAtomic64(1, &gCntTransientRefused) + 1;
+            if (nref <= 16 || (nref & 255) == 0)
+                FBLOG("nvAllocVram(%llu): REFUSED — transient ceiling (%lld of %llu bytes) (refusal #%lld)",
+                      (unsigned long long)want, (long long)before, (unsigned long long)NVRM_VRAM_TRANSIENT_CEILING,
+                      (long long)nref);
+            return false;
+        }
+    } else {
+        // Parked blocks keep their BAR1 mapping (see below), so they count against the budget. On a 256 MB BAR1 (every
+        // GTX 16, boards without Resizable BAR) the park ceiling is the smaller one, so surfaces keep most of the budget.
+        before = OSAddAtomic64((SInt64)want, &gVramMappedBytes) + gVramParkedBytes;
+        if (before + (SInt64)want > budget) {
+            OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
+            // A full 256 MB window is refused thousands of times in a session (one size, retried every frame), and each
+            // line costs a kernel log write on the path that is already out of room. Log the first eight, then every
+            // 256th with the running count, and say once who holds the window: grants against releases tell a working
+            // set from a leak.
+            const SInt64 nref = OSAddAtomic64(1, &gCntBudgetRefused) + 1;
+            if (nref <= 8 || (nref & 255) == 0)
+                FBLOG("nvAllocVram(%llu): REFUSED (#%lld) — BAR1 budget spent (%lld of %llu bytes). "
+                      "This is the resizable-BAR ceiling, not a VRAM shortage.",
+                      (unsigned long long)want, (long long)nref, (long long)before, (unsigned long long)budget);
+            if (nref == 1) bar1FullLog(budget);
+            return false;
+        }
     }
 
     struct NvKmsKapiMemory *mem = nullptr; void *kva = nullptr; NvU64 phys = 0;
@@ -3018,7 +3227,14 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
         }
         NvU64 p = fPhysForVa ? fPhysForVa(k) : 0;
         bool onScanout = p && fPhys  && fSize     && p < (fPhys + fSize)         && (p + want) > fPhys;
-        bool onConsole = p && fConsPhys && fConsSize && p < (fConsPhys + fConsSize) && (p + want) > fConsPhys;
+        bool overConsole = p && fConsPhys && fConsSize && p < (fConsPhys + fConsSize) && (p + want) > fConsPhys;
+        bool onConsole = overConsole && !gConsoleReleased;
+        if (overConsole && !onConsole && !onScanout) {
+            const SInt64 nreuse = OSAddAtomic64(1, &gCntConsoleReuse) + 1;
+            if (nreuse <= 4)
+                FBLOG("nvAllocVram(%llu): phys 0x%llx is in the released console range -- taking it (#%lld)",
+                      (unsigned long long)want, (unsigned long long)p, (long long)nreuse);
+        }
         if (!p) {
             // No physical address means RM's mapping table could not record this mapping. Parking it would hold one
             // more mapping per attempt and the next attempt fails the same way: release it and refuse this request.
@@ -3028,9 +3244,11 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
             break;
         }
         if (onScanout || onConsole) {
-            FBLOG("nvAllocVram: attempt %d phys 0x%llx %s — parking it and rolling again",
-                  attempt, (unsigned long long)p,
-                  !p ? "has no physical address" : onScanout ? "OVERLAPS THE SCANOUT" : "OVERLAPS THE CONSOLE");
+            const SInt64 roll = OSAddAtomic64(1, &gCntParkRolls) + 1;
+            if (roll <= 32 || (roll & 4095) == 0)
+                FBLOG("nvAllocVram: attempt %d phys 0x%llx %s — parking it and rolling again (roll #%lld)",
+                      attempt, (unsigned long long)p, onScanout ? "OVERLAPS THE SCANOUT" : "OVERLAPS THE CONSOLE",
+                      (long long)roll);
             if (gNParkedForever < (int)(sizeof gParkedForever / sizeof gParkedForever[0]) &&
                 gVramParkedBytes + (SInt64)want <= nvrmParkCeiling(fBarLen)) {
                 // kept allocated AND mapped: the overlap is judged by the BAR1 address of this mapping, so unmapping
@@ -3042,6 +3260,10 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
                 gNParkedForever++;
                 OSAddAtomic64((SInt64)want, &gVramParkedBytes);
             } else {
+                const SInt64 rej = OSAddAtomic64(1, &gCntParkRejects) + 1;
+                if (rej <= 8 || (rej & 4095) == 0)
+                    FBLOG("nvAllocVram: park ceiling reached (%lld bytes over %d slots) — releasing the reject (#%lld)",
+                          (long long)gVramParkedBytes, gNParkedForever, (long long)rej);
                 fKms->unmapMemory(fDev, m, NVKMS_KAPI_MAPPING_TYPE_KERNEL, k); fKms->freeMemory(fDev, m);
                 // A surface larger than the park ceiling (a 3840x2560 desktop is 37.5 MB, the ceiling on a 256 MB BAR1
                 // is 32 MB) was never parked, so the same address came back on every attempt. Hold only the part of
@@ -3084,51 +3306,103 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
         mem = m; kva = k; phys = p;
     }
     if (!mem) {
-        OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
+        OSAddAtomic64(-(SInt64)want, acct);
         // Who holds the window, once per boot: a 256 MB BAR1 that fills up cannot be told apart from a leak by the
         // failure lines alone; grants against releases can.
         static volatile SInt32 said = 0;
-        if (OSCompareAndSwap(0, 1, &said))
-            FBLOG("BAR1 full: %lld grants (%lld bytes) vs %lld releases (%lld bytes); live %lld, console parks %lld bytes "
-                  "in %d slots, display %lld, budget %lld, BAR1 %llu",
-                  (long long)gCntGrant, (long long)gCntGrantBytes, (long long)gCntRelease, (long long)gCntReleaseBytes,
-                  (long long)gVramMappedBytes, (long long)gVramParkedBytes, gNParkedForever, (long long)gVramDisplayBytes,
-                  (long long)budget, (unsigned long long)fBarLen);
+        if (!transient && OSCompareAndSwap(0, 1, &said)) bar1FullLog(budget);
         return false;
     }
 
-    nvu_zero_wide(kva, (size_t)want);
+    const uint64_t tMapped = mach_absolute_time();
+    if (gVramCeClear && ceClear(mem, want)) OSAddAtomic64(1, &gCntCeClears);
+    else { nvu_zero_wide(kva, (size_t)want); OSAddAtomic64(1, &gCntCpuClears); }
     volatile NvU64 *q = (volatile NvU64 *)kva;
     q[0] = 0x5A5AA5A5C0FFEE01ull;
     NvU64 back = q[0];
     q[0] = 0;
+    const uint64_t tZeroed = mach_absolute_time();
     if (back != 0x5A5AA5A5C0FFEE01ull) {
         FBLOG("nvAllocVram(%llu): kva %p phys 0x%llx WROTE 0x5A5AA5A5C0FFEE01 AND READ 0x%llx — "
               "the aperture is not live; refusing to hand this out",
               (unsigned long long)want, kva, (unsigned long long)phys, (unsigned long long)back);
         fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
         fKms->freeMemory(fDev, mem);
-        OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
+        OSAddAtomic64(-(SInt64)want, acct);
         return false;
     }
 
     const UInt64 allocationCookie = gAllocations.insert(mem, want);
     if (!allocationCookie) {
+        // 4096 live grants (the table's capacity) or a cookie overflow. Transient grants are no longer held under
+        // the 192 MB BAR1 budget, so this ceiling is now the one a leak would hit first: say so instead of refusing silently.
+        const SInt64 n = OSAddAtomic64(1, &gCntTableFull) + 1;
+        if (n <= 8 || (n & 1023) == 0)
+            FBLOG("nvAllocVram(%llu): REFUSED — allocation table full (%lld live grants: %lld granted, %lld released) (#%lld)",
+                  (unsigned long long)want, (long long)(gCntGrant - gCntRelease), (long long)gCntGrant, (long long)gCntRelease, (long long)n);
         fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
-        fKms->freeMemory(fDev, mem); OSAddAtomic64(-(SInt64)want, &gVramMappedBytes); return false;
+        fKms->freeMemory(fDev, mem); OSAddAtomic64(-(SInt64)want, acct); return false;
+    }
+    if (transient) {
+        // Cleared and checked: drop the BAR1 window. phys stays the address it had, which no lifetime mapping can
+        // hold (the scanouts keep theirs); the caller's kva NULL is what marks the grant transient in vramRelease.
+        fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
+        kva = nullptr;
+        OSAddAtomic64(1, &gCntTransientGrants);
     }
     r->allocationCookie = allocationCookie;
     advanceFlipEpoch();   // before the caller can see this memory, so it can never match an entry made for a freed one
     r->handle = mem; r->kva = kva; r->phys = (unsigned long long)phys;
     r->actualSize = (unsigned long long)want;
-    r->mappedTotal = (unsigned long long)(before + (SInt64)want);
+    r->mappedTotal = transient ? (unsigned long long)gVramMappedBytes : (unsigned long long)(before + (SInt64)want);
     fVramGrants++;
     OSAddAtomic64(1, &gCntGrant); OSAddAtomic64((SInt64)want, &gCntGrantBytes);
-    if (fVramGrantLogged < 16) { fVramGrantLogged++;
-        FBLOG("nvAllocVram #%u: %llu bytes REAL VRAM — kva %p phys 0x%llx  [BAR1 %llu / %llu]",
+    if (fVramGrantLogged < 16 || (transient && gCntTransientGrants <= 8)) { fVramGrantLogged++;
+        FBLOG("nvAllocVram #%u: %llu bytes REAL VRAM — kva %p phys 0x%llx  [BAR1 %llu / %llu]%s",
               fVramGrants, (unsigned long long)want, kva, (unsigned long long)phys,
-              r->mappedTotal, (unsigned long long)budget); }
+              r->mappedTotal, (unsigned long long)budget, transient ? " TRANSIENT (BAR1 window dropped)" : ""); }
+    noteGrantTiming(want, tEntry, tGate, tMapped, tZeroed, mach_absolute_time());
     return true;
+}
+
+// Zero `bytes` of a fresh grant on the copy engine: NVRM (this framebuffer's provider's provider) runs it with the RM's
+// CeUtils and waits for it. False when that NVRM has no nvSurfClear (an older build answers kIOReturnUnsupported) or the
+// clear failed; the caller then clears by CPU.
+bool NVRMNVDAFramebuffer::ceClear(struct NvKmsKapiMemory *mem, NvU64 bytes)
+{
+    static const OSSymbol *sym = nullptr;
+    if (!sym) sym = OSSymbol::withCStringNoCopy(NVRM_SS_FN_CLEAR);
+    IOService *nub = getProvider(), *rm = nub ? nub->getProvider() : nullptr;
+    if (!sym || !rm || !rm->metaCast("NVRM") || !mem || !fDev) return false;
+    struct NVRMSurfClear c; nvu_zero(&c, sizeof c);
+    c.version = NVRM_SS_RM_VERSION; c.kapiDevice = fDev; c.kapiMemory = mem; c.length = bytes;
+    const IOReturn rc = rm->callPlatformFunction(sym, false, &c, nullptr, nullptr, nullptr);
+    if (rc == kIOReturnSuccess && c.status == 0) return true;
+    static volatile SInt32 logged = 0;
+    if (OSIncrementAtomic(&logged) < 4)
+        FBLOG("nvAllocVram(%llu): copy-engine clear unavailable (0x%x, status 0x%x) -- clearing by CPU", (unsigned long long)bytes, rc, c.status);
+    return false;
+}
+
+// Where a grant's time goes: waiting for the display gate, NVKMS allocate + BAR1 map (with any re-rolls), the CPU clear
+// through the write-combined window, and the rest (table, unmap of a transient window). A grant WindowServer waits for
+// stalls the frame that needed it, so the slow ones are logged with their split.
+void NVRMNVDAFramebuffer::noteGrantTiming(NvU64 bytes, uint64_t t0, uint64_t tGate, uint64_t tMapped, uint64_t tZeroed, uint64_t tEnd)
+{
+    uint64_t total = 0, gateNs = 0, mapNs = 0, zeroNs = 0, tailNs = 0;
+    absolutetime_to_nanoseconds(tEnd - t0, &total); absolutetime_to_nanoseconds(tGate - t0, &gateNs);
+    absolutetime_to_nanoseconds(tMapped - tGate, &mapNs); absolutetime_to_nanoseconds(tZeroed - tMapped, &zeroNs);
+    absolutetime_to_nanoseconds(tEnd - tZeroed, &tailNs);
+    const SInt64 us = (SInt64)(total / 1000), zus = (SInt64)(zeroNs / 1000);
+    OSAddAtomic64(1, &gCntGrantTimed); OSAddAtomic64(us, &gGrantUsSum); OSAddAtomic64(zus, &gGrantZeroUsSum);
+    if (us > gGrantUsMax) gGrantUsMax = us;
+    if (zus > gGrantZeroUsMax) gGrantZeroUsMax = zus;
+    if (us >= 4000) {
+        const SInt64 n = OSAddAtomic64(1, &gCntGrantSlow) + 1;
+        if (n <= 24 || (n & 255) == 0)
+            FBLOG("nvAllocVram(%llu): slow grant %lld us = gate %llu + alloc/map %llu + clear %llu + rest %llu us (#%lld)",
+                  (unsigned long long)bytes, (long long)us, gateNs / 1000, mapNs / 1000, zeroNs / 1000, tailNs / 1000, (long long)n);
+    }
 }
 
 bool NVRMNVDAFramebuffer::vramRelease(struct NVRMVramRequest *r)
@@ -3140,7 +3414,9 @@ bool NVRMNVDAFramebuffer::vramRelease(struct NVRMVramRequest *r)
     advanceFlipEpoch();   // every cached surface made before this free stops matching (see gFlipEpoch)
     if (r->kva) fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, r->kva);
     fKms->freeMemory(fDev, mem);
-    if (r->actualSize) OSAddAtomic64(-(SInt64)r->actualSize, &gVramMappedBytes);
+    // kva NULL: a transient grant, never counted against BAR1 (vramtest mode 1 also passes NULL, deliberately leaking
+    // its mapping; that debug path now credits the transient counter instead).
+    if (r->actualSize) OSAddAtomic64(-(SInt64)r->actualSize, r->kva ? &gVramMappedBytes : &gVramTransientBytes);
     OSAddAtomic64(1, &gCntRelease); OSAddAtomic64((SInt64)r->actualSize, &gCntReleaseBytes);
     r->handle = nullptr; r->kva = nullptr; r->phys = 0; r->actualSize = 0; r->allocationCookie = 0;
     return true;
@@ -3231,7 +3507,25 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
 bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h,
                                    unsigned pitch, int *rcOut, bool pure, UInt64 cookie)
 {
+    bool deferred = false; uint64_t ft0 = 0;
+    bool accepted = flipToMemoryGated(mem, w, h, pitch, rcOut, pure, cookie, &deferred, &ft0);
+    if (deferred) {   // submitted and accepted under the gate; its latch is waited for here, with the gate free
+        OSAddAtomic64(1, &gCntFlipUnlocked);
+        accepted = waitFlipLatched(true, true);
+        if (!accepted && rcOut) *rcOut = -1;
+        const SInt64 us = (SInt64)((mach_absolute_time() - ft0) / 1000);
+        OSAddAtomic64(us, &gFlipUsSum); OSAddAtomic64(1, &gFlipN); if (us > gFlipUsMax) gFlipUsMax = us;
+    }
+    return accepted;
+}
+
+bool NVRMNVDAFramebuffer::flipToMemoryGated(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch,
+                                            int *rcOut, bool pure, UInt64 cookie, bool *deferred, uint64_t *submittedAt)
+{
     NVRMDisplayGate gate; if (!gate.valid() || fSubmissionFaulted) return false;
+    // A flip an overlapping caller still waits for outside the gate is settled first, so the cache below never evicts a
+    // surface that may still be on screen.
+    if (fFlipInFlight && !waitFlipLatched(false, true)) return false;
     if (mem) {
         const UInt64 bytes = gAllocations.size(mem, cookie);
         if (!bytes || !w || !h || w > 65535 || h > 65535 || (UInt64)w * 4 > pitch || (UInt64)pitch * h > bytes) return false;
@@ -3326,9 +3620,10 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
     lr->flags.surfaceChanged = NV_TRUE;
     if (!lean)
         lr->flags.srcXYChanged = lr->flags.srcWHChanged = lr->flags.dstXYChanged = lr->flags.dstWHChanged = NV_TRUE;
+    const bool deferWait = pure && gFlipUnlockedWait;
     const uint64_t ft0 = mach_absolute_time();
-    NvBool ok = submitConfig(cfg, rep, NV_TRUE, false, false, true);
-    if (pure) { const SInt64 us = (SInt64)((mach_absolute_time() - ft0) / 1000);
+    NvBool ok = submitConfig(cfg, rep, NV_TRUE, false, false, true, deferWait);
+    if (pure && !deferWait) { const SInt64 us = (SInt64)((mach_absolute_time() - ft0) / 1000);
         OSAddAtomic64(us, &gFlipUsSum); OSAddAtomic64(1, &gFlipN); if (us > gFlipUsMax) gFlipUsMax = us; }
     // IN_PROGRESS on a refusal is the previous flip still on its way (submitConfig's late path, or NVKMS's own answer
     // to a flip over an outstanding one): the caller keeps its frame and presents the next.
@@ -3337,6 +3632,7 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
     if (rcOut) *rcOut = rc;
     const bool accepted = ok && rc == NV_KMS_FLIP_RESULT_SUCCESS;
     if (accepted) fFrontSurf = surf;
+    if (accepted && deferWait) { fFlipInFlight = true; *deferred = true; *submittedAt = ft0; }
     fFlipCount++;
     if (fFlipCount <= 8 || (fFlipCount % 600) == 0)
         FBLOG("flipToMemory #%u -> ok %u rc %d (surface %p memory %p)",
@@ -3409,6 +3705,18 @@ IODeviceMemory *NVRMNVDAFramebuffer::getApertureRange(IOPixelAperture aperture)
     return (IODeviceMemory *)IOMemoryDescriptor::withAddressRange(
         target, bytes, kIODirectionNone | kIOMemoryMapperNone, NULL);
 }
+uint64_t NVRMNVDAFramebuffer::attrLogCount(unsigned kind, IOSelect sel, IOReturn r, uintptr_t v)
+{   // log1: WindowServer polls some attributes ('hdcs') hundreds of times a second, and logging every answer made up more
+    // than half of the whole system log, all of it written to the boot disk. An answer is logged when it changes, then at
+    // its 10th, 100th, 1000th... identical repeat. Returns the repeat count to log, or 0 to stay quiet.
+    const uint64_t key = ((uint64_t)kind << 32) | sel;
+    AttrSeen *e = nullptr, *lru = &fAttrSeen[0];
+    for (AttrSeen &s : fAttrSeen) { if (s.key == key) { e = &s; break; } if (s.n < lru->n) lru = &s; }
+    if (!e || e->r != r || e->v != v) { if (!e) e = lru; e->key = key; e->r = r; e->v = v; e->n = 1; return 1; }
+    uint64_t n = ++e->n, m = n;
+    while (m % 10 == 0) m /= 10;
+    return m == 1 ? n : 0;
+}
 IOReturn NVRMNVDAFramebuffer::getAttribute(IOSelect attribute, uintptr_t *value)
 {
     FBSEL(attribute);
@@ -3416,22 +3724,13 @@ IOReturn NVRMNVDAFramebuffer::getAttribute(IOSelect attribute, uintptr_t *value)
     if (attribute == kIOHardwareCursorAttribute) {
         uintptr_t v = (fCursorEnabled && fCurSurf && fCurKva) ? 1 : 0;
         if (value) *value = v;
-        FBLOG("getAttribute '%s' -> %lu (hardware cursor)", _s, (unsigned long)v);
+        if (uint64_t n = attrLogCount(0, attribute, kIOReturnSuccess, v))
+            FBLOG("getAttribute '%s' -> %lu (hardware cursor) #%llu", _s, (unsigned long)v, (unsigned long long)n);
         return kIOReturnSuccess;
     }
     IOReturn r = super::getAttribute(attribute, value);
-    // WindowServer polls some attributes many times a second ('hdcs', HDCP state: 2,019 of 2,703 framebuffer lines in
-    // one report, issue #216), which buried every real error. An attribute is logged again only when its answer changes.
-    static struct { IOSelect a; IOReturn r; uintptr_t v; } seen[16];
-    static unsigned nseen;
-    const uintptr_t v = value ? *value : 0;
-    unsigned i = 0;
-    while (i < nseen && seen[i].a != attribute) i++;
-    if (i == nseen || seen[i].r != r || seen[i].v != v) {
-        FBLOG("getAttribute '%s' -> 0x%x val %lu", _s, r, (unsigned long)v);
-        if (i == nseen && nseen < 16) nseen++;
-        if (i < 16) { seen[i].a = attribute; seen[i].r = r; seen[i].v = v; }
-    }
+    if (uint64_t n = attrLogCount(0, attribute, r, value ? *value : 0))
+        FBLOG("getAttribute '%s' -> 0x%x val %lu #%llu", _s, r, value ? (unsigned long)*value : 0ul, (unsigned long long)n);
     return r;
 }
 IOReturn NVRMNVDAFramebuffer::getAttributeForConnection(IOIndex connectIndex, IOSelect attribute, uintptr_t *value)
@@ -3454,7 +3753,8 @@ IOReturn NVRMNVDAFramebuffer::getAttributeForConnection(IOIndex connectIndex, IO
         return kIOReturnUnsupported;
     default: {
         IOReturn r = super::getAttributeForConnection(connectIndex, attribute, value);
-        FBLOG("getAFC '%s' -> super 0x%x val %lu", _s, r, value ? (unsigned long)*value : 0ul);
+        if (uint64_t n = attrLogCount(1, attribute, r, value ? *value : 0))
+            FBLOG("getAFC '%s' -> super 0x%x val %lu #%llu", _s, r, value ? (unsigned long)*value : 0ul, (unsigned long long)n);
         return r;
     }
     }
@@ -3555,7 +3855,8 @@ IOReturn NVRMNVDAFramebuffer::setAttribute(IOSelect attribute, uintptr_t value)
         return (r == kIOReturnUnsupported) ? kIOReturnSuccess : r;
     }
     IOReturn r = super::setAttribute(attribute, value);
-    FBLOG("setAttribute '%s' value %lu -> 0x%x", c, (unsigned long)value, r);
+    if (uint64_t n = attrLogCount(2, attribute, r, value))
+        FBLOG("setAttribute '%s' value %lu -> 0x%x #%llu", c, (unsigned long)value, r, (unsigned long long)n);
     return r;
 }
 // What IOGraphics does when a framebuffer powers on after system sleep (IOFBController::computeState, then

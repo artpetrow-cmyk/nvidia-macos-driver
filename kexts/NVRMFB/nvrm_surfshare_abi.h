@@ -48,4 +48,14 @@ struct NVRMSurfPageoff {
     unsigned long long length;
     unsigned long long usec;
 };
+// nvSurfClear: fill the first `length` bytes of a kapi allocation with zeroes on the copy engine (NVRMFB clears every VRAM
+// grant this way; through the BAR1 window the CPU managed ~50 MB/s, 150-300 ms a surface). version NVRM_SS_RM_VERSION.
+#define NVRM_SS_FN_CLEAR "nvSurfClear"
+struct NVRMSurfClear {
+    unsigned int version;
+    unsigned int status;
+    void *kapiDevice, *kapiMemory;
+    unsigned long long length;
+    unsigned long long usec;
+};
 #endif
