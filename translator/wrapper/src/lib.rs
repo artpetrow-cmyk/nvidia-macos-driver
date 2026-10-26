@@ -435,7 +435,7 @@ pub extern "C" fn nvmtl_translate_fc(
     }
     let specialized = match metal2vulkan::specialize_air_function_constants(ll, &values) {
         Ok(v) => v,
-        Err(e) => { set_err(&format!("AIR specialization: {e}")); return -1; }
+        Err(e) => { let e = format!("AIR specialization: {e}"); dump_failed_fc(ll, None, st, &values, &e); set_err(&e); return -1; }
     };
     // A library may declare `[[visible]]` function references that only a function-constant-disabled
     // path calls. The pre-emit refusal is a TEXT search for `.MTL_VISIBLE_FN_REF`, so it fired on such a
@@ -459,8 +459,27 @@ pub extern "C" fn nvmtl_translate_fc(
             std::mem::forget(b);
             0
         }
-        Err(e) => { set_err(&e); -1 }
+        Err(e) => { dump_failed_fc(ll, Some(specialized.as_ref()), st, &values, &e); set_err(&e); -1 }
     }
+}
+
+// fcdump1 (NullMoth dev): the function-constant path's failures, under the same NVMTL_DUMP_FAILED_DIR switch -
+// <hash>-<stage>-fc.ll (as received), .spec.ll (after specialization), .constants (index size hex) and .err
+fn dump_failed_fc(ll: &str, spec: Option<&str>, st: Stage, values: &[(u32, Vec<u8>)], e: &str) {
+    let Some(dir) = std::env::var_os("NVMTL_DUMP_FAILED_DIR") else { return };
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ll.hash(&mut h); values.hash(&mut h);
+    let base = std::path::Path::new(&dir).join(format!("{:016x}-{:?}-fc", h.finish(), st));
+    let consts: String = values.iter().map(|(i, v)| {
+        let hex: String = v.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{i} {} {hex}\n", v.len())
+    }).collect();
+    let r = std::fs::write(base.with_extension("ll"), ll)
+        .and_then(|_| std::fs::write(base.with_extension("constants"), consts))
+        .and_then(|_| match spec { Some(s) => std::fs::write(base.with_extension("spec.ll"), s), None => Ok(()) })
+        .and_then(|_| std::fs::write(base.with_extension("err"), e));
+    if let Err(w) = r { eprintln!("nvmtl_translate_fc: NVMTL_DUMP_FAILED_DIR write failed: {w}"); }
 }
 
 #[no_mangle]
