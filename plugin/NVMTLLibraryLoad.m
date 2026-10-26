@@ -108,6 +108,8 @@ static int nvmtl_xlate_ready(void) {
         void *h = dlopen(xpath, RTLD_NOW | RTLD_LOCAL);
         if (h) nvmtl_translator_cache_tag(xpath, gXlateTag, sizeof gXlateTag);
         if (!getenv("NVMTL_NO_AIR_UNROLL")) strlcat(gXlateTag, "-u2", sizeof gXlateTag);
+        // stitched kernels are inlined before translation (nvmtl_air_inline_wanted): SPIR-V cached from the old text is stale
+        { const char *e = getenv("NVMTL_AIR_INLINE"); if (!(e && *e == '0')) strlcat(gXlateTag, "-ai3", sizeof gXlateTag); }
         if (!h) { nvlog("translate: dlopen(%s): %s", NVMTL_XLATE_LIB, dlerror()); return; }
         xlate = (nvmtl_translate_fn)dlsym(h, "nvmtl_translate");
         { char tid[1200];
@@ -293,10 +295,13 @@ static void nvmtl_spvcache_trim_async(NSString *dir) {
 // The SPIR-V cache folder is chosen once, by creating it and writing to it. Sandboxed agents (iconservicesagent) could
 // not create the folder beside their AIR cache; every store failed with "folder doesn't exist" and every launch
 // translated its shaders again. The process's own temporary folder is always writable inside its sandbox.
+static BOOL nvmtl_cache_store(NSData *d, NSString *path);
 static BOOL nvmtl_dir_writable(NSString *d) {
     if (!d || ![[NSFileManager defaultManager] createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil]) return NO;
     NSString *probe = [d stringByAppendingPathComponent:[NSString stringWithFormat:@".probe-%d", getpid()]];
-    const BOOL ok = [[NSData data] writeToFile:probe options:0 error:nil];
+    // sbx1: probed the way the cache is written (plain write + rename): in WebKit's GPU process Foundation's write
+    // reports failure even when the file was created, and the cache would be judged unwritable there
+    const BOOL ok = nvmtl_cache_store([NSData data], probe);
     if (ok) unlink(probe.fileSystemRepresentation);
     return ok;
 }
@@ -433,13 +438,36 @@ static NSCache *nvmtl_memo(void) {
 }
 
 static BOOL nvmtl_air_unroll_wanted(NSData *air);
+static BOOL nvmtl_air_inline_wanted(NSData *air);
+// sbx1: cache files are written plain and renamed into place. Foundation's atomic write needs fsync and rmdir, both refused
+// in WebKit's GPU process: there every store failed (and left an "(A Document Being Saved By ...)" directory), and a
+// non-atomic NSData write created the file but still reported failure. open/write/close/rename are allowed everywhere.
+static BOOL nvmtl_cache_store(NSData *d, NSString *path)
+{
+    if (!d || !path.length) return NO;
+    char tmp[PATH_MAX];
+    if (snprintf(tmp, sizeof tmp, "%s.%d.%08x.tmp", path.fileSystemRepresentation, getpid(), arc4random()) >= (int)sizeof tmp) return NO;
+    const int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) return NO;
+    const uint8_t *b = d.bytes; size_t left = d.length; BOOL ok = YES;
+    while (left) {
+        const ssize_t w = write(fd, b, left);
+        if (w < 0) { if (errno == EINTR) continue; ok = NO; break; }
+        b += w; left -= (size_t)w;
+    }
+    if (close(fd) != 0) ok = NO;
+    if (ok && rename(tmp, path.fileSystemRepresentation) == 0) return YES;
+    unlink(tmp);
+    return NO;
+}
+static BOOL nvmtl_cache_store_text(NSString *t, NSString *path) { return nvmtl_cache_store([t dataUsingEncoding:NSUTF8StringEncoding], path); }
 static NSString *nvmtl_aircache_path(NSData *air) {
     unsigned char h[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256(air.bytes, (CC_LONG)air.length, h);
     char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
     for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", h[i]);
     return [[nvmtl_aircache_dir() stringByAppendingPathComponent:@(hex)] stringByAppendingPathExtension:
-            nvmtl_air_unroll_wanted(air) ? @"u2.ll" : @"ll"];
+            nvmtl_air_unroll_wanted(air) ? @"u2.ll" : nvmtl_air_inline_wanted(air) ? @"ai3.ll" : @"ll"];
 }
 
 static BOOL nvmtl_run_air_opt(const char *input, const char *output) {
@@ -602,6 +630,58 @@ static BOOL nvmtl_air_unroll_wanted(NSData *air) {
 // before it gets there: a library over the cap falls through to the out-of-process path below, where a
 // crash costs a failed translation instead of the app.
 #define NVMTL_AIR_MAX_BYTES (64u * 1024u * 1024u)
+/* Metal's function stitcher (Core Image builds its kernels with it) hands helpers aggregates that carry a constant
+   pointer - coreimage::Sampler_h is { texture, sampler, constant float4x4 *, float2 }. The translator loses the
+   pointer's byte offset on the way through the aggregate: ci_asgDownH read its sampling matrix from the start of the
+   argument buffer instead of +112, every output row sampled the same input row, and the small-icon glyph masks came
+   out as solid rectangles. Inlining the stitched helpers lets SROA turn the pointer back into a plain GEP. */
+/* ail3: the same loss happens for a constant pointer that crosses TWO calls on its way into a linked visible function.
+   RenderBox's custom effects (primitive_custom_fragment & co.) hand `Globals + 1` to an internal helper
+   (RB::Shader::sample_custom), which passes it on to custom_fn - IconServices' sdfFill_v1/glassHighlight_v1 read their
+   scale/bias there. The linked function read the first Globals instead (tools/visptr2test.m: FAIL with a helper in
+   between, PASS with a direct call), the glass coverage came out 0 and the App Store "A" vanished. Modules that define
+   or reference visible functions get their internal helpers inlined too, so the call reaching custom_fn is direct. */
+static BOOL nvmtl_air_inline_wanted(NSData *air) {
+    static int off = -1; if (off < 0) { const char *e = getenv("NVMTL_AIR_INLINE"); off = e && *e == '0'; }
+    static const char needle[] = "airstitcher.", vis[] = "air.visible";
+    return !off && air.length && (memmem(air.bytes, air.length, needle, sizeof needle - 1) != NULL ||
+                                  memmem(air.bytes, air.length, vis, sizeof vis - 1) != NULL);
+}
+struct nvmtl_llvm_inl {
+    void *(*GetFirstFunction)(void *); void *(*GetNextFunction)(void *); int (*IsDeclaration)(void *); int (*GetLinkage)(void *);
+    unsigned (*GetEnumAttributeKindForName)(const char *, size_t); void *(*CreateEnumAttribute)(void *, unsigned, unsigned long long);
+    void (*AddAttributeAtIndex)(void *, unsigned, void *); void (*RemoveEnumAttributeAtIndex)(void *, unsigned, unsigned);
+};
+#define NVMTL_LLVM_INL_NAMES "LLVMGetFirstFunction", "LLVMGetNextFunction", "LLVMIsDeclaration", "LLVMGetLinkage", \
+    "LLVMGetEnumAttributeKindForName", "LLVMCreateEnumAttribute", "LLVMAddAttributeAtIndex", "LLVMRemoveEnumAttributeAtIndex"
+static struct nvmtl_llvm_inl gLLVMInl; static int gLLVMInlOk;
+#define NVMTL_AIR_INLINE_PIPELINE "always-inline,function(sroa,early-cse,simplifycfg)"
+static int nvmtl_air_force_inline(void *module) {
+    // Modules are decoded on several threads at once (Core Image compiles its kernels concurrently): a thread that
+    // saw a half-done setup skipped the inlining, and that module's text was cached for good (fbf13).
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Dl_info info; int ok = 0;
+        if (dladdr((const void *)nvLLVMRunPasses, &info) && info.dli_fname) {
+            void *lib = dlopen(info.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+            static const char *names[] = { NVMTL_LLVM_INL_NAMES }; void **slot = (void **)&gLLVMInl; ok = lib != NULL;
+            for (unsigned k = 0; lib && k < sizeof names / sizeof *names; k++) if (!(slot[k] = dlsym(lib, names[k]))) ok = 0;
+        }
+        if (!ok) nvlog("library: stitched-kernel inlining unavailable - libLLVM lacks the function/attribute API - ail1 FAILED");
+        gLLVMInlOk = ok;
+    });
+    if (!gLLVMInlOk) return -1;
+    void *ctx = gLLVMWalk.GetModuleContext(module);
+    unsigned ai = gLLVMInl.GetEnumAttributeKindForName("alwaysinline", 12), ni = gLLVMInl.GetEnumAttributeKindForName("noinline", 8);
+    int n = 0;
+    for (void *f = gLLVMInl.GetFirstFunction(module); f; f = gLLVMInl.GetNextFunction(f)) {
+        int link = gLLVMInl.GetLinkage(f);
+        if (gLLVMInl.IsDeclaration(f) || (link != 8 && link != 9)) continue;   // LLVMInternalLinkage, LLVMPrivateLinkage
+        if (ni) gLLVMInl.RemoveEnumAttributeAtIndex(f, ~0u, ni);
+        gLLVMInl.AddAttributeAtIndex(f, ~0u, gLLVMInl.CreateEnumAttribute(ctx, ai, 0)); n++;
+    }
+    return n;
+}
 static NSString *nvmtl_air_in_memory(NSData *air) {
     if (!nvmtl_bitcode_reader_ready()) return nil;
     if (air.length < 4 || air.length > NVMTL_AIR_MAX_BYTES) {
@@ -624,6 +704,17 @@ static NSString *nvmtl_air_in_memory(NSData *air) {
             else { int rt = nvmtl_retype_byte_geps(&gLLVMWalk, module);
                    nvlog("library: air unroll: simdgroup_matrix module (%lu bytes) unrolled + sroa, %d byte GEPs retyped", (unsigned long)air.length, rt); }
         }
+        else if (nvLLVMRunPasses && nvmtl_air_inline_wanted(air)) {
+            int nf = nvmtl_air_force_inline(module);
+            if (nf <= 0) { static _Atomic int said0; if (said0++ < 4) nvlog("library: ail1 stitched/visible-function module (%lu bytes): nothing inlined (%d)", (unsigned long)air.length, nf); }
+            if (nf > 0) {
+                void *opts = nvLLVMCreatePassBuilderOptions();
+                void *err = nvLLVMRunPasses(module, NVMTL_AIR_INLINE_PIPELINE, NULL, opts);
+                nvLLVMDisposePassBuilderOptions(opts);
+                if (err) { char *m = nvLLVMGetErrorMessage(err); nvlog("library: stitched-kernel inlining FAILED (%s) - translating as decoded", m ? m : "?"); if (m) nvLLVMDisposeErrorMessage(m); }
+                else { static _Atomic unsigned said; unsigned k2 = ++said; if (k2 <= 4 || !(k2 & (k2 - 1))) nvlog("library: ail1 stitched/visible-function module #%u (%lu bytes): %d helper(s) inlined + sroa", k2, (unsigned long)air.length, nf); }
+            }
+        }
         char *text = nvLLVMPrintModuleToString(module);
         if (text) { result = [NSString stringWithUTF8String:text]; nvLLVMDisposeMessage(text); }
     }
@@ -640,7 +731,7 @@ static NSString *nvmtl_air_to_text(NSData *air) {
     gAirMiss++;
     NSString *memoryIR = nvmtl_air_in_memory(air);
     if (memoryIR.length) {
-        if ([memoryIR writeToFile:cache atomically:YES encoding:NSUTF8StringEncoding error:nil]) gAirStored++;
+        if (nvmtl_cache_store_text(memoryIR, cache)) gAirStored++;
         return nvmtl_air_text_made(memoryIR);
     }
 
@@ -657,7 +748,7 @@ static NSString *nvmtl_air_to_text(NSData *air) {
         NSError *mkerr = nil;
         [[NSFileManager defaultManager] createDirectoryAtPath:nvmtl_aircache_dir()
                                   withIntermediateDirectories:YES attributes:nil error:&mkerr];
-        if ([ll writeToFile:cache atomically:YES encoding:NSUTF8StringEncoding error:nil]) gAirStored++;
+        if (nvmtl_cache_store_text(ll, cache)) gAirStored++;
     }
     return nvmtl_air_text_made(ll);
 }
@@ -866,13 +957,13 @@ NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, 
                 nvlog("library: translate %s (%s) FAILED: %s", name.UTF8String, stage.UTF8String, err); if (error) *error = @(err); return nil;
             }
             spvData = [NSData dataWithBytes:spv length:spvn];
-            { NSError *werr = nil;
-              if (spvp && [spvData writeToFile:spvp options:NSDataWritingAtomic error:&werr]) {
+            { if (spvp && nvmtl_cache_store(spvData, spvp)) {
                   gSpvStored++;
                   atomic_fetch_add_explicit(&gSpvAdded, (unsigned long long)spvData.length, memory_order_relaxed);
               } else if (spvp) {
+                  const int e = errno;
                   nvlog("spvcache: STORE FAILED %s (%zu bytes): %s", spvp.lastPathComponent.UTF8String,
-                        (size_t)spvData.length, werr.localizedDescription.UTF8String ?: "?");
+                        (size_t)spvData.length, strerror(e));
               } }
         }
         if (spv && xlate_free) xlate_free(spv, spvn);
@@ -948,7 +1039,7 @@ NSDictionary<NSString *, NSData *> *nvmtl_index_metallib_uncached(NSData *lib, N
 }
 
 static NSString *nvmtl_idx_path(NSData *key) {
-    NSMutableString *h = [NSMutableString stringWithString:@"idx2-"]; const uint8_t *d = key.bytes;
+    NSMutableString *h = [NSMutableString stringWithString:@"idx5-"]; const uint8_t *d = key.bytes;   // idx5: stitched + visible-function modules inlined (ai3)
     for (NSUInteger i = 0; i < key.length; i++) [h appendFormat:@"%02x", d[i]];
     return [nvmtl_aircache_dir() stringByAppendingPathComponent:[h stringByAppendingString:@".plist"]];
 }
@@ -1048,10 +1139,9 @@ static NSDictionary *nvmtl_index_metallib_disk(NSData *lib, NSData *key, NSDicti
         NSArray *ext = nvmtl_externs_of_airs(ai) ?: @[];
         NSData *out = [NSPropertyListSerialization dataWithPropertyList:@{@"v": @1, @"length": @(lib.length), @"blobs": rec, @"externs": ext}
                                                                  format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
-        NSString *tmp = [p stringByAppendingFormat:@".%d.tmp", getpid()];
-        if (out && [out writeToFile:tmp atomically:NO] && rename(tmp.fileSystemRepresentation, p.fileSystemRepresentation) == 0)
+        if (out && nvmtl_cache_store(out, p))
             nvlog("library index: disk record stored (%lu blobs, %lu externs) %s", (unsigned long)rec.count, (unsigned long)ext.count, p.lastPathComponent.UTF8String);
-        else { unlink(tmp.fileSystemRepresentation); nvlog("library index: could not store the disk record %s", p.lastPathComponent.UTF8String); }
+        else nvlog("library index: could not store the disk record %s", p.lastPathComponent.UTF8String);
     }
     return fns;
 }
@@ -1115,11 +1205,10 @@ NSData *nvmtl_libkey_for_file(NSString *path, NSData *lib, const struct stat *be
     r.mts = now.st_mtimespec.tv_sec; r.mtn = now.st_mtimespec.tv_nsec; r.cts = now.st_ctimespec.tv_sec; r.ctn = now.st_ctimespec.tv_nsec;
     memcpy(r.edge, edge, sizeof edge); memcpy(r.key, key.bytes, sizeof r.key);
     [[NSFileManager defaultManager] createDirectoryAtPath:nvmtl_aircache_dir() withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *tmp = [rp stringByAppendingFormat:@".%d.tmp", getpid()];
-    if ([[NSData dataWithBytes:&r length:sizeof r] writeToFile:tmp atomically:NO] && rename(tmp.fileSystemRepresentation, rp.fileSystemRepresentation) == 0) {
+    if (nvmtl_cache_store([NSData dataWithBytes:&r length:sizeof r], rp)) {
         const unsigned long st = atomic_fetch_add(&gLkStored, 1) + 1;
         if (!(st & (st - 1))) nvlog("library key memo: stored %lu (%lu B %s)", st, (unsigned long)lib.length, path.lastPathComponent.UTF8String);
-    } else { unlink(tmp.fileSystemRepresentation); nvlog("library key memo: could not store %s", name); }
+    } else nvlog("library key memo: could not store %s", name);
     return key;
 }
 NSDictionary<NSString *, NSData *> *nvmtl_translate_metallib_k(NSData *lib, NSData *knownKey, NSDictionary **stageOut, NSDictionary **airOut);
@@ -1248,6 +1337,16 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     NVMTLAirDigest *airDigest = nvmtl_air_state(ll);
     if (!json || !airDigest) return nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
     NSString *path = nvmtl_spvcache_path_air(airDigest, json, @"fc1");
+    // vis1: a specialization known to need linked visible functions skips the translation that cannot succeed alone
+    // (40-70 ms each, repeated for every icon effect in iconservicesagent, Spotlight and the Dock); the marker sits beside
+    // the cache entry and carries the translator tag in its name, so a new translator tries again
+    NSString *visMark = [path stringByAppendingString:@".vis"];
+    if (!getenv("NVMTL_FCCACHE_OFF") && access(visMark.fileSystemRepresentation, F_OK) == 0) {
+        static _Atomic unsigned long skipped; unsigned long k = ++skipped; utimes(visMark.fileSystemRepresentation, NULL);
+        if (k <= 2 || !(k & (k - 1))) nvlog("vis1 fc cache: %s calls visible functions - %lu translation(s) skipped, deferred to pipeline creation", name.UTF8String, k);
+        if (err) *err = @"unsupported Metal visible function reference (remembered)";
+        return nil;
+    }
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     const BOOL fcCacheOn = path && !getenv("NVMTL_FCCACHE_OFF");   // no folder, no key: NSCache throws on a nil key
     NSData *hit = fcCacheOn ? [nvmtl_memo() objectForKey:path] : nil;
@@ -1266,9 +1365,14 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
         }
     }
     gFcMiss++;
-    NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
+    NSString *why_ = nil;
+    NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, &why_);
+    if (err) *err = why_;
+    if (!result && ([why_ rangeOfString:@"visible function reference"].location != NSNotFound ||
+                    [why_ rangeOfString:@"Metal visible function table"].location != NSNotFound))
+        (void)nvmtl_cache_store([@"vis" dataUsingEncoding:NSUTF8StringEncoding], visMark);
     if (result) {
-        if (path && [result writeToFile:path atomically:YES]) gFcStored++;
+        if (path && nvmtl_cache_store(result, path)) gFcStored++;
         if (fcCacheOn && nvmtl_is_spirv(result)) [nvmtl_memo() setObject:result forKey:path cost:result.length];
         nvlog("fc cache: miss %s %lu B %.1f ms [%lu hit, %lu miss, %lu stored]", name.UTF8String,
               (unsigned long)result.length, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6,
@@ -1342,7 +1446,7 @@ static NSData *nvmtl_reflect_air_cached(NVMTLFunction *function, NSString *ll, N
     NSData *d = [NSData dataWithBytes:j length:jn];
     if (xlate_free) xlate_free(j, jn);
     id obj = d.length ? [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL] : nil;
-    if (path && [obj isKindOfClass:[NSDictionary class]] && [(NSDictionary *)obj count] && [d writeToFile:path atomically:YES]) gRfStored++;
+    if (path && [obj isKindOfClass:[NSDictionary class]] && [(NSDictionary *)obj count] && nvmtl_cache_store(d, path)) gRfStored++;
     if (useCache && [obj isKindOfClass:[NSDictionary class]] && [(NSDictionary *)obj count]) [nvmtl_memo() setObject:d forKey:path cost:d.length];
     if (!(mn & (mn - 1))) nvlog("refl cache: miss %s %zu B %.2f ms [%lu hit, %lu miss, %lu stored]", function ? function->_fname.UTF8String : "?",
                                 jn, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6, (unsigned long)gRfHit, mn, (unsigned long)gRfStored);
@@ -1381,7 +1485,7 @@ static NSData *nvmtl_translate_link_cached(NSString *ll, NSString *stage, const 
     }
     unsigned long mn = ++gLkMiss;
     NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
-    if (result && path && [result writeToFile:path atomically:YES]) gLkStored++;
+    if (result && path && nvmtl_cache_store(result, path)) gLkStored++;
     if (!(mn & (mn - 1))) nvlog("link cache: miss %lu B %.2f ms [%lu hit, %lu miss, %lu stored]", (unsigned long)result.length,
                                 (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6, (unsigned long)gLkHit, mn, (unsigned long)gLkStored);
     return result;
@@ -1790,7 +1894,7 @@ NSData *nvmtl_translate_variant(NVMTLFunction *fn, NSDictionary *states, NSDicti
     NSData *hit=[NSData dataWithContentsOfFile:path];uint32_t magic=0;
     if(hit.length>=20 && hit.length%4==0){memcpy(&magic,hit.bytes,4);if(magic==0x07230203){[nvmtl_memo() setObject:hit forKey:path cost:hit.length];nvlog("variant cache: hit %s",fn->_fname.UTF8String);return hit;}}
     NSData *result=nvmtl_translate_variant_uncached(fn,states,tgLen,err);
-    if(result){if(nvmtl_is_spirv(result))[nvmtl_memo() setObject:result forKey:path cost:result.length];BOOL stored=[result writeToFile:path atomically:YES];nvlog("variant cache: miss %s stored=%d",fn->_fname.UTF8String,stored);}
+    if(result){if(nvmtl_is_spirv(result))[nvmtl_memo() setObject:result forKey:path cost:result.length];BOOL stored=nvmtl_cache_store(result, path);nvlog("variant cache: miss %s stored=%d",fn->_fname.UTF8String,stored);}
     return result;
 }
 
@@ -2030,6 +2134,56 @@ BOOL nvmtl_needs_visible_link(NSString *air, NSString *why)
                 || [why rangeOfString:@"no linked function supplies it"].location != NSNotFound
                 || [why rangeOfString:@".MTL_UNRESOLVED_VISIBLE_FN"].location != NSNotFound);
 }
+// Every global an AIR module defines or declares, by name (quotes stripped).
+static NSMutableSet<NSString *> *nvmtl_air_global_names(NSString *air)
+{
+    NSMutableSet *names = [NSMutableSet new];
+    static NSRegularExpression *re; static dispatch_once_t once;
+    dispatch_once(&once, ^{ re = [NSRegularExpression regularExpressionWithPattern:
+        @"^(?:@(\"?)([^\"\\s=]+)\\1\\s*=|(?:define|declare)\\b[^@\\n]*@(\"?)([^\"\\s(]+)\\3\\()" options:NSRegularExpressionAnchorsMatchLines error:NULL]; });
+    if (!air.length || !re) return names;
+    for (NSTextCheckingResult *m in [re matchesInString:air options:0 range:NSMakeRange(0, air.length)]) {
+        NSRange r = [m rangeAtIndex:2]; if (r.location == NSNotFound) r = [m rangeAtIndex:4];
+        if (r.location != NSNotFound) [names addObject:[air substringWithRange:r]];
+    }
+    return names;
+}
+// The translator links a visible function by appending its module to the kernel's AIR as text and renames nothing,
+// so an internal global the module shares by name with the kernel resolves to ONE definition for both. Every
+// constexpr sampler is "@__air_sampler_state": RenderBox's custom-effect shaders (normalized, repeat) and the
+// IconServices glass functions they call (sdfFill_v1, glassHighlight_v1... coord::pixel, clamp_to_zero) then read
+// through the same sampler - the glass of every icon glyph came out wrong. Give each module's internal/private
+// globals that clash a module-unique name first (samplers keep their prefix, which is how the translator knows them).
+static NSString *nvmtl_air_unclash(NSString *air, NSMutableSet<NSString *> *taken, unsigned tag, NSString *what)
+{
+    static NSRegularExpression *re; static dispatch_once_t once;
+    dispatch_once(&once, ^{ re = [NSRegularExpression regularExpressionWithPattern:
+        @"^(?:@(\"?)([^\"\\s=]+)\\1\\s*=\\s*(?:internal|private)\\b|define\\s+(?:internal|private)\\b[^@\\n]*@(\"?)([^\"\\s(]+)\\3\\()"
+        options:NSRegularExpressionAnchorsMatchLines error:NULL]; });
+    if (!air.length || !re) return air;
+    NSMutableArray<NSString *> *clash = [NSMutableArray new];
+    for (NSTextCheckingResult *m in [re matchesInString:air options:0 range:NSMakeRange(0, air.length)]) {
+        NSRange r = [m rangeAtIndex:2]; if (r.location == NSNotFound) r = [m rangeAtIndex:4];
+        if (r.location == NSNotFound) continue;
+        NSString *nm = [air substringWithRange:r];
+        if ([taken containsObject:nm] && ![clash containsObject:nm]) [clash addObject:nm];
+    }
+    NSString *out = air; unsigned k = 0;
+    for (NSString *nm in clash) {
+        NSString *to = nil;
+        do { to = [nm hasPrefix:@"__air_sampler_state"] ? [NSString stringWithFormat:@"__air_sampler_state.%u", 7000000u + tag * 1000u + k]
+                                                       : [NSString stringWithFormat:@"%@.nvlk%u_%u", nm, tag, k];
+             k++; } while ([taken containsObject:to] || [out rangeOfString:[@"@" stringByAppendingString:to]].location != NSNotFound);
+        NSString *pat = [NSString stringWithFormat:@"@(\"?)%@\\1(?![A-Za-z0-9_.$])", [NSRegularExpression escapedPatternForString:nm]];
+        NSRegularExpression *rr = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:NULL];
+        if (!rr) continue;
+        out = [rr stringByReplacingMatchesInString:out options:0 range:NSMakeRange(0, out.length)
+                                     withTemplate:[NSString stringWithFormat:@"@$1%@$1", [NSRegularExpression escapedTemplateForString:to]]];
+        nvlog("lnk1 link: %s - its internal @%s clashes with the kernel or another linked module -> @%s", what.UTF8String, nm.UTF8String, to.UTF8String);
+    }
+    [taken unionSet:nvmtl_air_global_names(out)];
+    return out;
+}
 
 id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, NSArray *dylibs, NSError **err)
 {
@@ -2065,6 +2219,10 @@ id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, 
     NSMutableDictionary<NSString *, NSString *> *mods = [NSMutableDictionary new];
     NSMutableDictionary *fc = [NSMutableDictionary new];
     NSMutableString *seen = [NSMutableString new];
+    static int unclashOn = -1; if (unclashOn < 0) { const char *u = getenv("NVMTL_LINK_UNCLASH"); unclashOn = !(u && *u == '0');
+        nvlog("lnk1 link: clashing internal globals of linked modules renamed %s (NVMTL_LINK_UNCLASH=0 turns it off)", unclashOn ? "ON" : "OFF"); }
+    NSMutableSet<NSString *> *taken = unclashOn ? nvmtl_air_global_names(fn->_air) : nil;
+    unsigned tag = 0;
     for (id c in cands) {
         if (![c isKindOfClass:[NVMTLFunction class]]) { [seen appendFormat:@" [foreign %@ %@]", NSStringFromClass([c class]), [c name]]; continue; }
         NVMTLFunction *cf = (NVMTLFunction *)c;
@@ -2072,6 +2230,7 @@ id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, 
             (unsigned long)cf->_air.length, (unsigned long)cf->_fc.count];
         if (!cf->_air.length) continue;
         NSString *air = nvmtl_link_candidate_air(cf, NULL);
+        if (taken) air = nvmtl_air_unclash(air, taken, ++tag, cf->_fname ?: @"?");   // lnk1
         /* Only names the module really defines: validate_linkage() refuses the whole link otherwise. */
         for (NSString *nm in @[cf->_specName ?: @"", cf.name ?: @"", cf->_fname ?: @""])
             if (nm.length && !mods[nm] && nvmtl_air_defines(air, nm)) mods[nm] = air;

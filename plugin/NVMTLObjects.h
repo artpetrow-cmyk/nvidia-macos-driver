@@ -18,7 +18,7 @@ static inline NSMutableData *nvmtl_fc_storage(NSUInteger count) {
 }
 @class NVMTLHeap;
 @interface NVMTLBuffer : NSObject <MTLBuffer> { @public nvk_buffer _b; MTLStorageMode _storage; NVMTLHeap *_heap; NSUInteger _heapOffset;
-    void *_hostPtr; size_t _hostLen; id _hostDealloc;
+    void *_hostPtr; size_t _hostLen; id _hostDealloc; BOOL _hostRO;
     NVMTLHeap *_subHeap; NSUInteger _subCharge; BOOL _aliased;
     nvk_buffer _shadow; int _syncOut; int _zshadow;
     NSUInteger _dirtyLo, _dirtyHi; } @end
@@ -46,6 +46,8 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
   uint32_t _baseSlice, _baseLevel;
   uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
   nvk_buffer _vramBuf; BOOL _vramOn;
+  nvk_buffer _hostAlias; BOOL _hostAliasOn;   // sin2: a plane of a multi-plane IOSurface sampled straight from system memory
+  void *_sin3;                                // sin3: the kept import _hostAlias belongs to (not owned by this texture)
   BOOL _stex;
   uint64_t _resid;
   NSUInteger _usage;
@@ -59,6 +61,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return 
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
 @end
 @interface NVMTLFunction : NSObject <MTLFunction> { @public NSData *_spirv; NSString *_fname; NSString *_stage; NSString *_air; NSDictionary *_fc; NSArray *_embedded; unsigned char _bcHash[32]; BOOL _bcHashed;
+  BOOL _embNone;   // hot2: neither constexpr samplers nor argument-buffer fields - nvmtl_bind_embedded has nothing to do
   NSDictionary *_refl; NSDictionary *_airNames; NSArray *_arguments;
   id _lib; id _fcv; NSString *_specName; BOOL _needsLink; } @end
 NSDictionary *nvmtl_function_reflection(NVMTLFunction *function);
@@ -67,7 +70,8 @@ uint64_t nvmtl_resid_for_texture(id t);
 void nvmtl_resid_texture_gone(uint64_t token);
 uint64_t nvmtl_resid_for_sampler(id s);
 @interface NVMTLType : NSObject { @public MTLDataType _dataType; } @end
-@interface NVMTLVertexAttribute : NSObject { @public NSString *_name; NSUInteger _index; MTLDataType _dataType; } @end
+@interface NVMTLVertexAttribute : NSObject { @public NSString *_name; NSUInteger _index; MTLDataType _dataType;
+  BOOL _inactive, _patchData, _cpData; } @end   // tess2: post-tessellation stage-in members
 @interface NVMTLTextureReferenceType : NVMTLType { @public MTLDataType _texDataType; MTLTextureType _texType; MTLBindingAccess _access; BOOL _depth; } @end
 @interface NVMTLStructType : NVMTLType { @public NSArray *_members; } @end
 @interface NVMTLPointerType : NVMTLType { @public MTLDataType _elem; MTLBindingAccess _access; NSUInteger _align, _size; BOOL _isArgBuf; NVMTLStructType *_elemStruct; } @end
@@ -115,6 +119,8 @@ extern id gNVMTLMainDevice;
   @public nvk_cmdbuf _c; NVMTLCommandQueue *_queue; BOOL _committed, _commitMarking; BOOL _capacityHeld; MTLCommandBufferStatus _cbstatus;
   NVMTLTexture *_present;
   NSMutableArray *_presentations;
+  NSMutableArray *_latePresents;  // dp1: drawable presents the app made while this buffer still wrote the drawable
+  BOOL _presentsClosed;           // dp1: the GPU work is done, a present runs at once (class lock)
   NSMutableArray *_handlers;
   NSMutableArray *_scratch;
   NSMutableSet *_resources;
@@ -239,7 +245,11 @@ id<MTLCounterSet> nvmtl_timestamp_counter_set(void);
   BOOL _texSeen;
 } @end
 @interface NVMTLTexture () { @public NSString *_label; MTLResourceOptions _ropt; BOOL _shareable; BOOL _fbo;
+  NSString *_writerKey;      // ws1: "surface:plane" for the pending-write map, made once (under the map lock)
+  uint32_t _claimSeed; BOOL _claimed;   // ws1: vt1 already claimed the family VRAM at this seed
   MTLTextureSwizzleChannels _swz; BOOL _hasSwz; void *_swzView;
+  NVMTLBuffer *_srcBuf; NSUInteger _srcOff, _srcBPR; uint64_t _srcHash, _srcT;   // tsync1/mip1: texture over a host-copied buffer
+  uint8_t _mipHow;   // mipq1: 1 generateMipmaps, 2 rendered into a level > 0, 4 replaceRegion level > 0, 8 blit into a level > 0, 16 mip1
   void *_tbView, *_tbAlias; BOOL _tbStorage;
   int _resRefs;
   int _nviews;
@@ -260,6 +270,10 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d);
 @interface NVMTLCommandQueue () { @public NSString *_label; } @end
 @interface NVMTLCommandBuffer () { @public NSString *_label; uint64_t _rep; } @end
 @interface NVMTLCommandBuffer () { @public NSMutableSet *_stTwins; } @end
+@interface NVMTLCommandBuffer () { @public NVMTLBuffer *_siChunk; size_t _siUsed; NSMutableArray *_siChunks; } @end   // kstage3
+@interface NVMTLCommandBuffer () { @public
+  NSMutableArray *_suHeld;   // su1: IOSurfaces this buffer holds "in use" until it finished
+} @end
 @interface NVMTLTexture () { @public nvk_image _stTwin; BOOL _stTwinTried; BOOL _mipsWritten; } @end
 @interface NVMTLDepthStencilState () { @public NSString *_label; } @end
 @interface NVMTLSamplerState () { @public NSString *_label; } @end
@@ -267,11 +281,15 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d);
 @interface NVMTLComputePipelineState () { @public uint64_t _resid; NSUInteger _attrT, _askT; } @end
 // _sassKernel: machine code that runs before the Vulkan pipeline; _sassOnly: there is no Vulkan pipeline
 @interface NVMTLComputePipelineState () { @public id _sassKernel; BOOL _sassOnly; } @end
+@interface NVMTLComputePipelineState () { @public NSData *_stageIn; } @end   // kstage2: nvk_stagein, nil without [[stage_in]]
+@interface NVMTLComputeCommandEncoder () { @public MTLRegion _siRegion; BOOL _siSet; } @end   // kstage2: setStageInRegion:
 @interface NVMTLRenderPipelineState () { @public uint64_t _resid; } @end
 @interface NVMTLIndirectCommandBuffer () { @public uint64_t _resid; } @end
 @interface NVMTLIndirectCommand () - (void)nvmtlCopyFrom:(NVMTLIndirectCommand *)o; @end
 NSUInteger nvmtl_air_max_tg(NVMTLFunction *fn);
 @interface NVMTLRenderCommandEncoder () { @public NSString *_label; } @end
+@interface NVMTLRenderCommandEncoder () { @public NVMTLTexture *_attTex[8]; NSUInteger _attLevel[8], _attSlice[8]; NVMTLTexture *_fbcCopy[8]; BOOL _attMixed;
+    uint64_t _fbcMask[2][2]; void *_fbcView[2][128]; uint64_t _fbcImg[2][128]; } @end
 @interface NVMTLRenderCommandEncoder () { @public uint32_t _vstride[NVMTL_NVIN]; uint32_t _vstrideSet; } @end
 @interface NVMTLComputeCommandEncoder () { @public NSString *_label; } @end
 @interface NVMTLBlitCommandEncoder () { @public NSString *_label; } @end
@@ -285,7 +303,8 @@ NSUInteger nvmtl_air_max_tg(NVMTLFunction *fn);
 @interface NVMTLHeap () { @public NSUInteger *_fr; uint32_t _nfr, _cfr; os_unfair_lock _fl; BOOL _backed; } @end
 @interface NVMTLBuffer () { @public BOOL _subPlaced; } @end
 typedef struct { nvk_image img; uint32_t key[12]; NSUInteger off, len; } nvmtl_park_t;
-@interface NVMTLTexture () { @public BOOL _subPlaced, _parkable; uint32_t _pkey[12]; NSUInteger _pkLen; } @end
+@interface NVMTLTexture () { @public BOOL _subPlaced, _parkable, _dparkable; uint32_t _pkey[12]; NSUInteger _pkLen; } @end
+int nvmtl_dpark_take(const uint32_t *key, nvk_image *out);
 @interface NVMTLHeap () { @public nvmtl_park_t *_pk; uint32_t _npk; } @end
 @interface NVMTLBuffer () { @public nvmtl_park_t *_bpk; uint32_t _nbpk; os_unfair_lock _bpl; } @end
 @interface NVMTLTexture () { @public BOOL _bparkable; } @end

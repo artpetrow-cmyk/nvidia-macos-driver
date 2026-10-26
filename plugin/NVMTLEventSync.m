@@ -43,8 +43,11 @@ static int nvmtl_gsub_finish(NVMTLSubmissionPart *part) {
 // Queue keys and command-buffer references are weak. An abandoned recording is
 // never registered; completion removes committed entries without retaining VRAM.
 static NSMapTable *nvmtl_surface_writers;
+// ws1: built once per texture - WindowServer asked for it on every IOSurface texture bind (a string format each time);
+// callers hold the [NVMTLCommandBuffer class] lock, so the lazy store is not raced
 static NSString *nvmtl_surface_writer_key(NVMTLTexture *t) {
-    return [NSString stringWithFormat:@"%u:%lu", (unsigned)IOSurfaceGetID(t->_surf), (unsigned long)t->_plane];
+    if (!t->_writerKey) t->_writerKey = [NSString stringWithFormat:@"%u:%lu", (unsigned)IOSurfaceGetID(t->_surf), (unsigned long)t->_plane];
+    return t->_writerKey;
 }
 static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!cb || !t || !t->_surf) return NO;
@@ -256,6 +259,81 @@ static void nvmtl_ws_mark_ready(NVMTLCommandBuffer *cb) {
     objc_setAssociatedObject(cb, nvmtl_ws_marks_key, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     (void)nvmtl_ws_publish_settled(settled, nil);
 }
+// dp1: a drawable presented with [drawable present] (or AtTime:/AfterMinimumDuration:/WithOptions:) instead of
+// -[MTLCommandBuffer presentDrawable:] reaches the display only after the GPU has written it. Unity (Valheim) commits,
+// waits until scheduled and then calls [drawable present]: with ss1 off "scheduled" comes at submission, WindowServer
+// composited the drawable before the frame was drawn and showed what it held three frames earlier - the picture jumped
+// back and forth when running, menu highlights flickered under the mouse. With ss1 on (scheduled only after the writes)
+// the frames were right but the game waited for every frame (fps down by a quarter). Apple's GPUs order the display
+// after the writer; here the present itself waits: CAMetalDrawable's present methods are replaced (not in WindowServer),
+// and a present whose drawable an unfinished command buffer writes runs when that buffer finishes, from its completion.
+// The app never waits. A layer with presentsWithTransaction keeps the original call (its present belongs to a CA
+// transaction). NVMTL_PRESENT_AFTER_WRITES=0 turns it off.
+static _Atomic unsigned long long gDp1Deferred, gDp1Direct;
+static void nvmtl_dp1_census(void) {
+    const unsigned long long d = atomic_load(&gDp1Deferred), n = d + atomic_load(&gDp1Direct);
+    if (n & (n - 1)) return;
+    nvlog("dp1: %llu drawable presents, %llu of them waited for the GPU writes of their drawable", n, d);
+}
+static BOOL nvmtl_dp1_defer(NVMTLTexture *t, dispatch_block_t present) {
+    if (!t || !t->_surf) return NO;
+    @synchronized ([NVMTLCommandBuffer class]) {
+        NSString *key = nvmtl_surface_writer_key(t);
+        for (id queue in nvmtl_surface_writers.keyEnumerator) {
+            NVMTLPendingSurfaceWrite *write = [nvmtl_surface_writers objectForKey:queue][key];
+            NVMTLCommandBuffer *writer = write ? write->buffer : nil;
+            if (!writer || writer->_presentsClosed) continue;
+            if (!writer->_latePresents) writer->_latePresents = [NSMutableArray new];
+            [writer->_latePresents addObject:[present copy]];
+            return YES;
+        }
+    }
+    return NO;
+}
+static IMP gDp1Present, gDp1AtTime, gDp1AfterMin, gDp1WithOptions;
+static void nvmtl_dp1_go(id drawable, int kind, double arg, id options) {
+    NVMTLTexture *t = nil;
+    id layer = [drawable respondsToSelector:@selector(layer)] ? [drawable layer] : nil;
+    if (!(layer && [layer respondsToSelector:@selector(presentsWithTransaction)] && [(CAMetalLayer *)layer presentsWithTransaction])) {
+        SEL cached = sel_registerName("cachedTexture");   // the texture CA already made; texture would make one
+        id tex = [drawable respondsToSelector:cached] ? ((id (*)(id, SEL))objc_msgSend)(drawable, cached)
+                                                      : [(id<CAMetalDrawable>)drawable texture];
+        if ([tex isKindOfClass:[NVMTLTexture class]]) t = tex;
+    }
+    if (t && nvmtl_dp1_defer(t, ^{ nvmtl_dp1_go(drawable, kind, arg, options); })) {
+        atomic_fetch_add(&gDp1Deferred, 1); nvmtl_dp1_census(); return;
+    }
+    if (t) { atomic_fetch_add(&gDp1Direct, 1); nvmtl_dp1_census(); }
+    switch (kind) {
+        case 0: ((void (*)(id, SEL))gDp1Present)(drawable, @selector(present)); break;
+        case 1: ((void (*)(id, SEL, double))gDp1AtTime)(drawable, @selector(presentAtTime:), arg); break;
+        case 2: ((void (*)(id, SEL, double))gDp1AfterMin)(drawable, @selector(presentAfterMinimumDuration:), arg); break;
+        default: ((void (*)(id, SEL, id))gDp1WithOptions)(drawable, @selector(presentWithOptions:), options); break;
+    }
+}
+static void nvmtl_dp1_present(id self, SEL _cmd) { nvmtl_dp1_go(self, 0, 0, nil); }
+static void nvmtl_dp1_present_at(id self, SEL _cmd, double t) { nvmtl_dp1_go(self, 1, t, nil); }
+static void nvmtl_dp1_present_after(id self, SEL _cmd, double d) { nvmtl_dp1_go(self, 2, d, nil); }
+static void nvmtl_dp1_present_options(id self, SEL _cmd, id o) { nvmtl_dp1_go(self, 3, 0, o); }
+void nvmtl_dp1_install(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("NVMTL_PRESENT_AFTER_WRITES"), *pn = getprogname();
+        if ((e && e[0] == '0') || (pn && !strcmp(pn, "WindowServer"))) {
+            nvlog("dp1: drawable presents are not deferred (NVMTL_PRESENT_AFTER_WRITES=%s, %s)", e ? e : "unset", pn ? pn : "?"); return; }
+        Class c = NSClassFromString(@"CAMetalDrawable");
+        Method m0 = c ? class_getInstanceMethod(c, @selector(present)) : NULL;
+        Method m1 = c ? class_getInstanceMethod(c, @selector(presentAtTime:)) : NULL;
+        Method m2 = c ? class_getInstanceMethod(c, @selector(presentAfterMinimumDuration:)) : NULL;
+        Method m3 = c ? class_getInstanceMethod(c, @selector(presentWithOptions:)) : NULL;
+        if (!m0 || !m1 || !m2) { nvlog("dp1: CAMetalDrawable present methods not found - presents are not deferred"); return; }
+        gDp1Present = method_setImplementation(m0, (IMP)nvmtl_dp1_present);
+        gDp1AtTime = method_setImplementation(m1, (IMP)nvmtl_dp1_present_at);
+        gDp1AfterMin = method_setImplementation(m2, (IMP)nvmtl_dp1_present_after);
+        if (m3) gDp1WithOptions = method_setImplementation(m3, (IMP)nvmtl_dp1_present_options);
+        nvlog("dp1: drawable presents wait for the GPU writes of their drawable (%s presentWithOptions:)", m3 ? "with" : "without");
+    });
+}
 static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
     nvmtl_ws_mark_ready(cb);
     @synchronized ([NVMTLCommandBuffer class]) {
@@ -319,7 +397,20 @@ static int nvmtl_skip_empty_on(void) {
     memset(&_c, 0, sizeof(_c));
     part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
     // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
-    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && e[0] == '1'; }
+    // ss1: on by default only in iconservicesagent, whose renders reached iconservicesd before the GPU had drawn them (the
+    // cached icons were bare glass plates). Everywhere else upstream's default (off) stands: held for every buffer that
+    // writes a surface, CoreAnimation in Safari's GPU process waited in waitUntilScheduled for each layer flush (34 % of its
+    // queue, a web map stuttering). NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=1 turns it on outside WindowServer, =2 there too,
+    // =0 off everywhere.
+    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES");
+        const char *pn = getprogname(); const int ws = pn && !strcmp(pn, "WindowServer");
+        // ss2: on by default in WebKit's GPU process too. WebKit takes an IOSurface for the CPU (putImageData, getImageData)
+        // once its command buffer is scheduled, and the seed moves at that lock: with scheduled ahead of the GPU writes, a CPU
+        // write landed under a VRAM copy already called current and a read saw the old pixels (Safari: letters missing from a
+        // canvas spreadsheet, other pages scrambled). Safari with this on stayed smooth on a web map (22.10).
+        after = (e && e[0] == '0') ? 0 : (e && e[0] == '2') ? 1 : (e && e[0] == '1') ? !ws
+              : (pn && (!strcmp(pn, "iconservicesagent") || !strcmp(pn, "com.apple.WebKit.GPU")));
+        nvlog("ss1: scheduled after IOSurface writes %s (NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=%s)", after ? "ON" : "off", e ? e : "unset"); }
     NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
     for (NVMTLTexture *s in part->surfaces) if (after && s != drawable) _scheduleAfterPublish = YES;
     part->scratch = [_scratch copy]; part->signalEvent = event; part->value = value;
@@ -417,6 +508,63 @@ static int nvmtl_skip_empty_on(void) {
         _gpuTiming.host_after_ns = commands->timing.host_after_ns;
     }
 }
+// su1: IOSurface use counts for the GPU. Apple's drivers count an IOSurface as in use while a submitted command buffer
+// references it, and clients reuse a buffer only when IOSurfaceIsInUse says no (CA backing stores and their tiles,
+// CAMetalLayer drawables, CVPixelBufferPool). Found with the (since dropped) flip-after-fence experiment: apps cleared and
+// redrew tiles the GPU was still compositing (black squares on the panel, 12.10.2026). Held from commit until the buffer
+// finished; one count per surface however many buffers use it. NVMTL_SURFACE_USE: unset/1 = WindowServer, 2 = every
+// process, 0 = off.
+static NSMapTable *gSuCount; static os_unfair_lock gSuLock = OS_UNFAIR_LOCK_INIT;
+static _Atomic unsigned long long gSuHeld, gSuBuffers;
+static int nvmtl_su_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_SURFACE_USE"); const int ws = getprogname() && !strcmp(getprogname(), "WindowServer");
+        on = (e && e[0] == '0') ? 0 : (e && e[0] == '2') ? 1 : ws;
+        if (ws || (e && *e)) nvlog("su1: IOSurface use counts for the GPU %s (NVMTL_SURFACE_USE=%s)", on ? "ON - a surface stays in use until the buffers reading it finished" : "off", e ? e : "unset");
+    }
+    return on;
+}
+static void nvmtl_su_acquire(NVMTLCommandBuffer *cb) {
+    if (!nvmtl_su_on()) return;
+    NSMutableSet *seen = nil;
+    for (NVMTLSubmissionPart *p in cb->_parts) {
+        if (![p isKindOfClass:[NVMTLSubmissionPart class]]) continue;
+        for (id r in p->resources) {
+            if (![r isKindOfClass:[NVMTLTexture class]]) continue;
+            NVMTLTexture *t = r; NVMTLTexture *root = t->_parent ? t->_parent : t;
+            if (!root->_surf) continue;
+            id s = (__bridge id)root->_surf;
+            if (!seen) seen = [NSMutableSet new];
+            [seen addObject:s];
+        }
+    }
+    if (!seen.count) return;
+    cb->_suHeld = [NSMutableArray arrayWithCapacity:seen.count];
+    os_unfair_lock_lock(&gSuLock);
+    if (!gSuCount) gSuCount = [NSMapTable strongToStrongObjectsMapTable];
+    for (id s in seen) {
+        const unsigned long n = [[gSuCount objectForKey:s] unsignedLongValue];
+        if (!n) { IOSurfaceIncrementUseCount((__bridge IOSurfaceRef)s); atomic_fetch_add(&gSuHeld, 1); }
+        [gSuCount setObject:@(n + 1) forKey:s];
+        [cb->_suHeld addObject:s];
+    }
+    os_unfair_lock_unlock(&gSuLock);
+    const unsigned long long k = atomic_fetch_add(&gSuBuffers, 1) + 1;
+    if (k <= 2 || !(k & (k - 1))) nvlog("su1: %llu command buffers held their IOSurfaces in use until finished (%llu surfaces counted so far)",
+                                        k, (unsigned long long)atomic_load(&gSuHeld));
+}
+static void nvmtl_su_release(NVMTLCommandBuffer *cb) {
+    NSMutableArray *held = cb->_suHeld; cb->_suHeld = nil;
+    if (!held.count) return;
+    os_unfair_lock_lock(&gSuLock);
+    for (id s in held) {
+        const unsigned long n = [[gSuCount objectForKey:s] unsignedLongValue];
+        if (n <= 1) { [gSuCount removeObjectForKey:s]; IOSurfaceDecrementUseCount((__bridge IOSurfaceRef)s); }
+        else [gSuCount setObject:@(n - 1) forKey:s];
+    }
+    os_unfair_lock_unlock(&gSuLock);
+}
 - (void)nvmtlFinishExecution:(NSError *)error {
     if (_scheduleAfterPublish) { _scheduleAfterPublish = NO; [self nvmtlMarkScheduled]; }
     for (NSUInteger i = _nextPart; i < _parts.count; i++) {
@@ -430,10 +578,15 @@ static int nvmtl_skip_empty_on(void) {
             [nvmtl_quarantined_parts addObject:p];
         }
     }
+    // dp1: from here a present of a drawable this buffer wrote runs at once; the ones that came in while it ran go now,
+    // error or not (the app asked for them, and CoreAnimation gets the drawable back only through a present or release)
+    NSArray *late;
+    @synchronized ([NVMTLCommandBuffer class]) { _presentsClosed = YES; late = _latePresents; _latePresents = nil; }
     if (!error) {
         for (dispatch_block_t action in _presentations) action();
     }
     [_presentations removeAllObjects]; _present = nil;
+    for (dispatch_block_t present in late) present();
     double deviceStart = 0, deviceEnd = 0;
     if (!error && _gpuTimingSeen && !_gpuTimingInvalid)
         (void)nvmtl_vk_interval_seconds(&_gpuTiming, &deviceStart, &deviceEnd);
@@ -456,6 +609,7 @@ static int nvmtl_skip_empty_on(void) {
     [_surfOverwrites removeAllObjects]; _surfOverwrites = nil;
     if (!error) nvmtl_res2_cb_done(self);
     [self nvmtlReleaseCapacity];
+    nvmtl_su_release(self);
 }
 - (void)nvmtlFinishCallbacks {
     [_completionCondition lock];
@@ -566,8 +720,15 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
         {
             static int hold = -1;
             if (hold < 0) { const char *e = getenv("NVMTL_GSUB_HOSTPTR_LIFT"); hold = (e && *e && *e != '0') ? 0 : 1; }
-            if (hold && part->hasHostCopies) return NO;
+            if (hold) {
+                if (part->hasHostCopies) return NO;
+                for (id resource in part->resources)   // tsync1: a texture refreshed from its buffer at every submission
+                    if ([resource isKindOfClass:[NVMTLTexture class]] && nvmtl_texture_needs_sync((NVMTLTexture *)resource)) return NO;
+            }
         }
+        // tsync1: an ahead part refreshes its buffer-copied textures too (the copied buffers are synced just below)
+        for (id resource in part->resources)
+            if ([resource isKindOfClass:[NVMTLTexture class]]) nvmtl_texture_sync_in(resource);
         nvmtl_inflight *f = nvmtl_vk_inflight_new();
         if (!f) return NO;
         for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
@@ -642,6 +803,8 @@ static void nvmtl_gsub_ahead_pass1(void) {
         else {
             nvmtl_prepare_submission_copies(part);
             for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
+            for (id resource in part->resources)   // tsync1: textures copied from a buffer are refreshed as well
+                if ([resource isKindOfClass:[NVMTLTexture class]]) nvmtl_texture_sync_in(resource);
             result = nvmtl_vk_submit_wait(&part->commands);
         }
         if (result == -2) {
@@ -702,6 +865,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
     @synchronized ([NVMTLCommandBuffer class]) {
         _commitMarking = NO;
         nvmtl_surface_register_writes(self);
+        nvmtl_su_acquire(self);
         if (!nvmtl_pending_buffers) nvmtl_pending_buffers = [NSMutableArray new];
         [nvmtl_pending_buffers addObject:self];
         nvmtl_pump_buffers();
@@ -734,9 +898,15 @@ static void nvmtl_pump_buffers_sync(void) {
 }
 
 static uint64_t nvmtl_pump_generation;
+// On by default in WindowServer only. A process that draws IOSurfaces for another one reports "scheduled" sooner with it,
+// and with no GPU ordering between processes' channels the consumer can read a surface the producer's GPU has not
+// finished: a web app's list view in Safari flickered with half-drawn tiles (a screenshot, a later frame, was clean;
+// NVMTL_COMMIT_AHEAD=0 for Safari's GPU process alone fixed it). WindowServer's own surfaces are held by its completion
+// marks. NVMTL_COMMIT_AHEAD=1 turns it on elsewhere, =0 off.
 static BOOL nvmtl_commit_ahead_on(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_COMMIT_AHEAD"); on = !(e && e[0] == '0');
+    if (on < 0) { const char *e = getenv("NVMTL_COMMIT_AHEAD"), *pn = getprogname();
+        on = e ? (e[0] != '0') : (pn && !strcmp(pn, "WindowServer"));
         nvlog("commit: submit-ahead %s (NVMTL_COMMIT_AHEAD=%s)", on ? "also runs at commit while the worker waits" : "runs on the worker only", e ? e : "unset"); }
     return on;
 }
