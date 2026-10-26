@@ -1,0 +1,120 @@
+--- a/src/nvidia/arch/nvalloc/unix/src/escape.c
++++ b/src/nvidia/arch/nvalloc/unix/src/escape.c
+@@ -54,6 +54,9 @@
+ 
+ #include <ctrl/ctrl00e0.h>
+ 
++#include <class/cla06c.h>  // KEPLER_CHANNEL_GROUP_A (gpr1)
++#include <ctrl/ctrla06c.h> // NVA06C_CTRL_CMD_SET_TIMESLICE, NVA06C_CTRL_CMD_SET_INTERLEAVE_LEVEL (gpr1)
++
+ #define NV_CTL_DEVICE_ONLY(nv)                 \
+ {                                              \
+     if (((nv)->flags & NV_FLAG_CONTROL) == 0)  \
+@@ -290,8 +293,93 @@
+ ct_assert(NV_OFFSETOF(NVOS21_PARAMETERS, hObjectNew) == NV_OFFSETOF(NVOS64_PARAMETERS, hObjectNew));
+ ct_assert(NV_OFFSETOF(NVOS21_PARAMETERS, hClass) == NV_OFFSETOF(NVOS64_PARAMETERS, hClass));
+ ct_assert(NV_OFFSETOF(NVOS21_PARAMETERS, pAllocParms) == NV_OFFSETOF(NVOS64_PARAMETERS, pAllocParms));
++ct_assert(NV_OFFSETOF(NVOS21_PARAMETERS, hRoot) == NV_OFFSETOF(NVOS64_PARAMETERS, hRoot));
+ 
++//
++// gpr1 (macOS port, 15.10.2026): GPU time for WindowServer. WindowServer waits for each composite to finish before
++// it swaps the display (the Metal plugin cannot order the swap after an NVK fence), two or three waits per display
++// update. Behind a game that kept the graphics engine busy, each wait sat out the game's whole 1024 us timeslice and
++// its wait-for-idle preemption: WindowServer answered its clients in 5-25 ms instead of 0.13 ms, display updates
++// missed the 10 ms refresh. WindowServer's own groups get the HIGH runlist interleave level and a longer timeslice,
++// so a composite is not cut in two. Other groups keep RM's timeslice: a shorter one (256 us) made it worse - with
++// wait-for-idle preemption every expiry drains the game's work, and a tiny job's p90 wait grew from 4.9 to 10.5 ms
++// (Valheim, 15.10.2026). debug.nvrm_gpr_* apply to channel groups made after a change (WindowServer makes its own at
++// login); a refused control leaves RM's defaults and is counted.
++//
++NvU32 nvrm_gpr_on = 1;
++NvU32 nvrm_gpr_app_us = 0;                                      // 0: RM's default (1024 us)
++NvU32 nvrm_gpr_ws_us = 2048;                                    // 0: RM's default
++NvU32 nvrm_gpr_ws_level = NVA06C_CTRL_INTERLEAVE_LEVEL_HIGH;    // above HIGH: RM's default (MEDIUM)
++NvU32 nvrm_gpr_ws_groups, nvrm_gpr_app_groups, nvrm_gpr_refused, nvrm_gpr_last_rc;
+ 
++static NV_STATUS RmGprControl(NvHandle hClient, NvHandle hObject, NvU32 cmd, void *pParams, NvU32 paramsSize,
++                              API_SECURITY_INFO secInfo)
++{
++    NVOS54_PARAMETERS ctrl;
++
++    portMemSet(&ctrl, 0, sizeof(ctrl));
++    ctrl.hClient = hClient;
++    ctrl.hObject = hObject;
++    ctrl.cmd = cmd;
++    ctrl.params = NV_PTR_TO_NvP64(pParams);
++    ctrl.paramsSize = paramsSize;
++    // The caller's own client and rights; only the parameters are ours, on the kernel stack.
++    secInfo.paramLocation = PARAM_LOCATION_KERNEL;
++    Nv04ControlWithSecInfo(&ctrl, secInfo);
++    return ctrl.status;
++}
++
++static void RmGprChannelGroup(NvHandle hClient, NvHandle hGroup, API_SECURITY_INFO secInfo)
++{
++    static const char ws[] = "WindowServer";
++    static NvU32 logged;
++    char name[32];
++    NV_STATUS tsStatus = NV_OK, levelStatus = NV_OK;
++    NvBool bWindowServer, bLevel;
++    NvU32 us, n;
++
++    if (!nvrm_gpr_on)
++        return;
++
++    portMemSet(name, 0, sizeof(name));
++    os_get_current_process_name(name, sizeof(name) - 1);
++    bWindowServer = (portStringCompare(name, ws, sizeof(ws)) == 0);
++    us = bWindowServer ? nvrm_gpr_ws_us : nvrm_gpr_app_us;
++    bLevel = bWindowServer && nvrm_gpr_ws_level <= NVA06C_CTRL_INTERLEAVE_LEVEL_HIGH;
++
++    if (us != 0)
++    {
++        NVA06C_CTRL_TIMESLICE_PARAMS ts;
++
++        portMemSet(&ts, 0, sizeof(ts));
++        ts.timesliceUs = us;
++        tsStatus = RmGprControl(hClient, hGroup, NVA06C_CTRL_CMD_SET_TIMESLICE, &ts, sizeof(ts), secInfo);
++    }
++    if (bLevel)
++    {
++        NVA06C_CTRL_INTERLEAVE_LEVEL_PARAMS level;
++
++        portMemSet(&level, 0, sizeof(level));
++        level.tsgInterleaveLevel = nvrm_gpr_ws_level;
++        levelStatus = RmGprControl(hClient, hGroup, NVA06C_CTRL_CMD_SET_INTERLEAVE_LEVEL, &level, sizeof(level), secInfo);
++    }
++
++    n = __atomic_add_fetch(bWindowServer ? &nvrm_gpr_ws_groups : &nvrm_gpr_app_groups, 1, __ATOMIC_RELAXED);
++    if (tsStatus != NV_OK || levelStatus != NV_OK)
++    {
++        __atomic_add_fetch(&nvrm_gpr_refused, 1, __ATOMIC_RELAXED);
++        nvrm_gpr_last_rc = (tsStatus != NV_OK) ? tsStatus : levelStatus;
++    }
++    if ((n <= 2 || tsStatus != NV_OK || levelStatus != NV_OK) && __atomic_add_fetch(&logged, 1, __ATOMIC_RELAXED) <= 24)
++    {
++        nv_printf(NV_DBG_ERRORS, "NVRM: gpr1 %s channel group 0x%x: timeslice %u us%s rc 0x%x, interleave %s rc 0x%x\n",
++                  name, hGroup, us, us ? "" : " (RM default)", tsStatus,
++                  !bLevel ? "default" : nvrm_gpr_ws_level == NVA06C_CTRL_INTERLEAVE_LEVEL_HIGH ? "HIGH" :
++                  nvrm_gpr_ws_level == NVA06C_CTRL_INTERLEAVE_LEVEL_MEDIUM ? "MEDIUM" : "LOW", levelStatus);
++    }
++}
++
++
+ NV_STATUS RmValidateIoctl(NvU32 cmd, NvU32 size)
+ {
+     int i = 0;
+@@ -503,6 +591,13 @@
+                 Nv04AllocWithAccessSecInfo(pApiAccess, secInfo);
+             }
+ 
++            // gpr1: GPU time for WindowServer (RmGprChannelGroup)
++            if ((bAccessApi ? pApiAccess->status : pApi->status) == NV_OK &&
++                pApi->hClass == KEPLER_CHANNEL_GROUP_A)
++            {
++                RmGprChannelGroup(pApi->hRoot, pApi->hObjectNew, secInfo);
++            }
++
+             break;
+         }
+ 

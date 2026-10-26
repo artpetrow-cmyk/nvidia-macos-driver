@@ -13,6 +13,8 @@
 /* NVRM_ESC_SURF_DIRTY with this plane bit gives up with NVRM_SS_BUSY instead of waiting for the accelerator lock
  * (accelerators that publish NVAccelSurfaceWait) */
 #define NVRM_SS_PLANE_TRYLOCK  0x40000000u
+/* NVRM_ESC_SURF_DIRTY with this plane bit is a vic1 VRAM-identity query (NVAccel answers 0x40000000 | allocation cookie) */
+#define NVRM_SS_PLANE_VIC_QUERY 0x20000000u
 #define NVRM_SS_BAD_VERSION   0x80000001u
 #define NVRM_SS_OFF           0x80000002u
 #define NVRM_SS_NO_SURFACE    0x80000003u
@@ -51,6 +53,16 @@ struct NVRMSurfPageoff {
     void *kapiDevice, *kapiMemory;
     const unsigned long long *pages;
     unsigned long long pageCount;
+    unsigned long long length;
+    unsigned long long usec;
+};
+// nvSurfClear: fill the first `length` bytes of a kapi allocation with zeroes on the copy engine (NVRMFB clears every VRAM
+// grant this way; through the BAR1 window the CPU managed ~50 MB/s, 150-300 ms a surface). version NVRM_SS_RM_VERSION.
+#define NVRM_SS_FN_CLEAR "nvSurfClear"
+struct NVRMSurfClear {
+    unsigned int version;
+    unsigned int status;
+    void *kapiDevice, *kapiMemory;
     unsigned long long length;
     unsigned long long usec;
 };

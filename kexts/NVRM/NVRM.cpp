@@ -33,6 +33,7 @@ extern "C" {
 #include "nvrm_surfshare_abi.h"
 extern "C" int nvrm_surfshare_rm(struct NVRMSurfShareRm *);
 extern "C" int nvrm_surfshare_pageoff(struct NVRMSurfPageoff *, void *nv);
+extern "C" int nvrm_surfshare_clear(struct NVRMSurfClear *, void *nv);
 extern "C" task_t current_task(void);
 extern "C" int nvrm_gpuva_alloc(struct NVRMGpuVaRequest *);
 extern "C" int nvrm_gpuva_map(struct NVRMGpuVaRequest *);
@@ -40,6 +41,29 @@ extern "C" int nvrm_gpuva_free(struct NVRMGpuVaRequest *);
 extern "C" bool nvrm_query_vram_kb(NvU32 gpuId, NvU32 *pRamKb, NvU32 *pTotalKb, NvU32 *pStatus);
 extern "C" bool nvrm_query_gpu_profile(NvU32 gpuId, NvU32 *pArch, NvU32 *pImpl, NvU32 *pCls3d, NvU32 *pClsCompute,
                                        NvU32 *pClsCopy, NvU32 *pClsEnc, NvU32 *pClsDec, NvU32 *pStatus);
+#include "nvrm_gpustats_abi.h"
+extern "C" bool nvrm_gpu_stats(NvU32 gpuId, struct NvrmGpuStats *out);   // gst1, nvrm_gpustats.cpp
+#include <sys/sysctl.h>
+// gpr1: GPU time for WindowServer, set on every new channel group in RM's escape.c (patches/610-rm-gpr1-gpu-priority.patch)
+extern "C" { extern NvU32 nvrm_gpr_on, nvrm_gpr_app_us, nvrm_gpr_ws_us, nvrm_gpr_ws_level,
+                          nvrm_gpr_ws_groups, nvrm_gpr_app_groups, nvrm_gpr_refused, nvrm_gpr_last_rc; }
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_on, CTLFLAG_RW | CTLFLAG_LOCKED, &nvrm_gpr_on, 0, "gpr1: set the timeslice and interleave level of new channel groups");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_app_us, CTLFLAG_RW | CTLFLAG_LOCKED, &nvrm_gpr_app_us, 0, "gpr1: timeslice of a new channel group outside WindowServer, us (0: RM default 1024)");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_ws_us, CTLFLAG_RW | CTLFLAG_LOCKED, &nvrm_gpr_ws_us, 0, "gpr1: timeslice of a new WindowServer channel group, us (0: RM default 1024)");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_ws_level, CTLFLAG_RW | CTLFLAG_LOCKED, &nvrm_gpr_ws_level, 0, "gpr1: interleave level of a new WindowServer channel group (0 low, 1 medium, 2 high, 3 RM default)");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_ws_groups, CTLFLAG_RD | CTLFLAG_LOCKED, &nvrm_gpr_ws_groups, 0, "gpr1: WindowServer channel groups seen");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_app_groups, CTLFLAG_RD | CTLFLAG_LOCKED, &nvrm_gpr_app_groups, 0, "gpr1: other channel groups seen");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &nvrm_gpr_refused, 0, "gpr1: channel groups where RM refused a setting");
+SYSCTL_UINT(_debug, OID_AUTO, nvrm_gpr_last_rc, CTLFLAG_RD | CTLFLAG_LOCKED, &nvrm_gpr_last_rc, 0, "gpr1: RM status of the last refusal");
+static void nvrm_gpr_sysctl_register(void)
+{
+    static bool done; if (done) return; done = true;
+    { int v = 0; if (PE_parse_boot_argn("-nvrmnogpr", &v, sizeof v)) nvrm_gpr_on = 0; }   // RM's scheduling defaults from boot
+    sysctl_register_oid(&sysctl__debug_nvrm_gpr_on); sysctl_register_oid(&sysctl__debug_nvrm_gpr_app_us);
+    sysctl_register_oid(&sysctl__debug_nvrm_gpr_ws_us); sysctl_register_oid(&sysctl__debug_nvrm_gpr_ws_level);
+    sysctl_register_oid(&sysctl__debug_nvrm_gpr_ws_groups); sysctl_register_oid(&sysctl__debug_nvrm_gpr_app_groups);
+    sysctl_register_oid(&sysctl__debug_nvrm_gpr_refused); sysctl_register_oid(&sysctl__debug_nvrm_gpr_last_rc);
+}
 kern_return_t _start(kmod_info_t *ki, void *data);
 kern_return_t _stop(kmod_info_t *ki, void *data);
 KMOD_EXPLICIT_DECL(com.nullmoth.NVRM, "0.1", _start, _stop)
@@ -426,6 +450,7 @@ bool NVRM::start(IOService *provider)
             sysctl_register_oid(&sysctl__debug_nvrm_pm_waited);
         }
     }
+    nvrm_gpr_sysctl_register();
     UInt8 bus = fPCI->getBusNumber(), dev = fPCI->getDeviceNumber(), fn = fPCI->getFunctionNumber();
     nv_xnu_register_pci(fPCI, 0, bus, dev, fn);
     nv_xnu_power_refresh();        // read the power source here, where no firmware lock is held
@@ -823,8 +848,12 @@ void NVRM::autoGo(void *p0, wait_result_t)
             // never did - WindowServer presented nothing until the flip path opened, so every boot was a black login
             // screen for exactly 60 s (72 s on a GTX 1650 SUPER with the login on top). The checks need no wait.
             const char *why = nullptr;
-            if (!s->fBar1Placed) why = "BAR1 not placed (small firmware window)";
-            else if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOAccelerator"))) {
+            // small BAR (RTX 2070 TU106, 256 MB, 13.10.2026): NVAccel's keep2 re-adoption of shared VRAM, the flip-cache
+            // flush on mode changes and transient grants are what blacked these screens; with them zero-copy flips
+            // run on the small window. -nvrmsmallbarnoflip restores the copy path for an unplaced BAR1.
+            if (!s->fBar1Placed && PE_parse_boot_argn("-nvrmsmallbarnoflip", nb, sizeof(nb))) why = "BAR1 not placed (small firmware window, -nvrmsmallbarnoflip)";
+            else if (!s->fBar1Placed) LOG("auto-go: BAR1 not placed (small firmware window) - zero-copy flip starts anyway (keep2/transient; -nvrmsmallbarnoflip keeps the copy path)");
+            if (!why) if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOAccelerator"))) {
                 while (OSObject *o = it->getNextObject()) {
                     const char *cn = o->getMetaClass()->getClassName();
                     if (cn && strncmp(cn, "NV", 2)) { why = "another GPU's accelerator is running"; LOG("auto-go: accelerator %s present", cn); break; }
@@ -1679,6 +1708,11 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         return OSAddAtomic(0, &fGpuPm) == kGpuPmRunning ? kIOReturnSuccess : kIOReturnNotReady;
     if (fn && fn->isEqualTo("NVRMGpuPower"))         // sent down to the framebuffers; an older NVRMFB passes it back up
         return kIOReturnUnsupported;
+    if (fn && fn->isEqualTo("nvrmGpuStats")) {      // gst1: NVAccel's PerformanceStatistics. p1 = struct NvrmGpuStats *
+        struct NvrmGpuStats *st = (struct NvrmGpuStats *)p1; if (!st) return kIOReturnBadArgument;
+        if (!getProperty("nvrm-display")) return kIOReturnNotReady;   // RM is not up until the auto-go has run
+        return nvrm_gpu_stats(fNv.gpu_id, st) ? kIOReturnSuccess : kIOReturnError;
+    }
     if (fn && fn->isEqualTo("NVRMBootScreenDone")) {
         if (fBootScreen) { fBootScreen->release(); fBootScreen = nullptr; LOG("boot screen: buffer released after the takeover"); }
         return kIOReturnSuccess;
@@ -1714,6 +1748,8 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
             return nvrm_surfshare_rm((struct NVRMSurfShareRm *)p1) ? kIOReturnIOError : kIOReturnSuccess;
         if (fn->isEqualTo(NVRM_SS_FN_PAGEOFF))
             return nvrm_surfshare_pageoff((struct NVRMSurfPageoff *)p1, &fNv) ? kIOReturnIOError : kIOReturnSuccess;
+        if (fn->isEqualTo(NVRM_SS_FN_CLEAR))
+            return nvrm_surfshare_clear((struct NVRMSurfClear *)p1, &fNv) ? kIOReturnIOError : kIOReturnSuccess;
     }
     return IOService::callPlatformFunction(fn, wait, p1, p2, p3, p4);
 }
@@ -1956,8 +1992,27 @@ IOReturn NVRMUserClient::sBindFd(OSObject *target, void *reference, IOExternalMe
     // two connections answered for one fd and the Vulkan device in WindowServer could not be created.
     const int64_t v = (int64_t)args->scalarInput[0];
     if (v > 0x7FFFFFFFLL || v < -0x80000000LL) return kIOReturnBadArgument;
-    me->fBound = (int)v;
+    // bindfd1: a connection pooled without a detach still holds the fd number it was last bound to; a new connection
+    // given the same number then shares (pid, fd) with it, nv_xnu_lookup_fd answers whichever comes first, and
+    // MAP_MEMORY could arm the pooled one ("no mapping context" -> VK_ERROR_OUT_OF_DEVICE_MEMORY, MPS aborted Telegram).
+    // The number belongs to the connection bound to it last: any other connection of this process holding it is unbound.
+    const int fd = (int)v;
+    int unbound = 0;
+    if (gNvClientsLock) IOLockLock(gNvClientsLock);
+    if (fd >= 0)
+        for (int i = 0; i < NV_XNU_MAX_CLIENTS; i++) {
+            NVRMUserClient *k = gNvClients[i];
+            if (k && k != me && k->fPid == me->fPid && k->fBound == fd) { k->fBound = -2; unbound++; }
+        }
+    me->fBound = fd;
     me->fEverBound = true;
+    if (gNvClientsLock) IOLockUnlock(gNvClientsLock);
+    if (unbound) {
+        static SInt32 told;
+        if (OSIncrementAtomic(&told) < 16)
+            kprintf("NVRM-xnu: bindfd1 fd %d of pid %d taken by client %d - %d older client(s) still bound to it unbound\n",
+                    fd, me->fPid, me->fFd, unbound);
+    }
     // A stale mapping context is cleared when the connection is bound to a real fd, the only point where it
     // could be used for a new mapping. Not on detach (a negative value): the userland driver detaches a
     // connection it keeps alive for mappings that are still live, and clearing the context there left those
